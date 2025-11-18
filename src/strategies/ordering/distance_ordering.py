@@ -47,14 +47,17 @@ class DistanceOrdering(AgentOrdering):
         goals: List[int],
     ) -> List[int]:
         """
-        Стандартное поведение LaCAM: НЕ переназначать порядок,
-        иначе это ломает свойства LL-constraints.
-
-        Но при желании можно делать динамическое reorder:
-            - dist(config[i] → goals[i])
-            - last_conflicts
-            - набегание очереди агента
+        Динамическое обновление порядка: дальше от цели → выше приоритет.
+        При равенстве расстояний сохраняем прежний порядок, чтобы не
+        ломать детерминизм и стабильность.
         """
+        pos_prev = {ag: idx for idx, ag in enumerate(prev_order)}
+        dist_list = []
+        for aid in range(len(goals)):
+            d = graph.dist(config[aid], goals[aid])
+            if d < 0:
+                d = 10**9
+            dist_list.append((d, aid))
 
-        # Классический LaCAM просто оставляет порядок прежним
-        return prev_order
+        dist_list.sort(key=lambda x: (-x[0], pos_prev.get(x[1], len(prev_order))))
+        return [aid for _, aid in dist_list]

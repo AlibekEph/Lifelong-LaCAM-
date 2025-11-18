@@ -34,6 +34,8 @@ class PIBTGenerator(ConfigGenerator):
     def __init__(self):
         # текущие цели агентов (может подменяться Lifelong LaCAM)
         self.current_goals: TypingOptional[List[int]] = None
+        # глобальный счётчик тактов для круговой ротации приоритетов (PIBT)
+        self._time_step: int = 0
 
     def set_current_goals(self, goals: List[int]) -> None:
         """Позволяет LaCAM/Lifelong передавать актуальные цели перед генерацией шага."""
@@ -104,21 +106,28 @@ class PIBTGenerator(ConfigGenerator):
             candidates = [forced_moves[agent]]
         else:
             neigh = list(graph.neighbors(cur_v))
+            has_stay = False
             # включаем stay
             if not graph.is_blocked(cur_v) and cur_v not in neigh:
-                neigh.append(cur_v)
+                has_stay = True
+                #pass
 
             # сортировка по эвристике: ближе к цели → раньше
             if self.current_goals is not None:
                 goal = self.current_goals[agent]
 
-                def _heur(v: int) -> int:
+                def _heur(v: int) -> float:
                     d = graph.dist(v, goal)
-                    return d if d >= 0 else 10**9
+                    if d < 0:
+                        d = 10**9
+                    return d
 
-                candidates = sorted(neigh, key=_heur)
+                # сортируем движущиеся кандидаты, stay добавим в конец
+                move_candidates = sorted([v for v in neigh if v != cur_v], key=_heur)
+                candidates = move_candidates + ([cur_v] if has_stay else [])
             else:
-                candidates = neigh
+                move_candidates = [v for v in neigh if v != cur_v]
+                candidates = move_candidates + ([cur_v] if has_stay else [])
 
         # 2) Пытаемся каждый кандидат
         for v in candidates:
@@ -169,7 +178,7 @@ class PIBTGenerator(ConfigGenerator):
                 return True
 
             # Если наш приоритет НЕ выше → не можем "пинать" occupant.
-            if pri[agent] >= pri[occupant]:
+            if pri[agent] > pri[occupant]:
                 continue
 
             # Если occupant уже в рекурсивном стеке → цикл, пропускаем
@@ -226,8 +235,12 @@ class PIBTGenerator(ConfigGenerator):
         num_agents = old_conf.num_agents()
         order: List[int] = hl_node.order
 
+        # Круговая ротация приоритетов по глобальному времени (PIBT rule)
+        offset = self._time_step % num_agents if num_agents > 0 else 0
+        rotated = order[offset:] + order[:offset]
+
         pri: List[int] = [0] * num_agents
-        for pr, ag in enumerate(order):
+        for pr, ag in enumerate(rotated):
             pri[ag] = pr
 
         pos2agent: Dict[int, int] = {}
@@ -238,7 +251,7 @@ class PIBTGenerator(ConfigGenerator):
         reserved: Set[int] = set()
         in_stack: Set[int] = set()
 
-        for agent in order:
+        for agent in rotated:
             if new_pos[agent] is not None:
                 continue
             if not self._pibt_dfs(
@@ -260,6 +273,9 @@ class PIBTGenerator(ConfigGenerator):
 
         if self._has_edge_conflict(old_conf.pos, new_pos):
             return None
+
+        # завершили попытку LL-шага → увеличиваем глобальный таймер
+        self._time_step += 1
 
         return Configuration(tuple(new_pos))  # type: ignore[arg-type]
 
@@ -288,8 +304,16 @@ class PIBTGenerator(ConfigGenerator):
                 # приоритет по дистанции до цели, если есть
                 if self.current_goals is not None:
                     goal = self.current_goals[aid]
-                    neigh.sort(key=lambda v: graph.dist(v, goal) if graph.dist(v, goal) >= 0 else 10**9)
-                cand_lists.append(neigh)
+                    def _heur(v: int) -> float:
+                        d = graph.dist(v, goal)
+                        if d < 0:
+                            d = 10**9
+                        if v == cur:
+                            d += 0.5
+                        return d
+
+                    neigh.sort(key=_heur)
+            cand_lists.append(neigh)
 
         # DFS по комбинациям
         new_pos = [None] * num_agents

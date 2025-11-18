@@ -1,0 +1,11 @@
+# Visualization outputs
+vis_outputs/
+
+# Python cache/artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Editor/OS noise
+.DS_Store
+.idea/

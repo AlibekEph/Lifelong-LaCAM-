@@ -77,7 +77,7 @@ class LifelongLaCAMIntegrated:
         self.completed_tasks_history: List[List[int]] = [[] for _ in range(self.num_agents)]
         
         # Explored таблица
-        self._explored: Dict[Configuration, HLNode] = {}
+        self._explored: Dict[tuple[Configuration, tuple[int, ...]], HLNode] = {}
         
         # Инициализация root node
         root_constraint = Constraint(parent=None, who=None, where=None, depth=0)
@@ -96,7 +96,7 @@ class LifelongLaCAMIntegrated:
             parent=None,
         )
         
-        self._explored[self.start_config] = root_node
+        self._explored[self._state_key(self.start_config, self.goals)] = root_node
         self.open_policy.push(root_node)
         
         # Статистика
@@ -150,6 +150,9 @@ class LifelongLaCAMIntegrated:
                 current_pos = hl_node.config[agent_idx]
                 
                 next_vertices: Iterable[int] = list(self.graph.neighbors(current_pos))
+                
+                
+                next_vertices.sort(key=lambda v: self.graph.dist(v, self.goals[agent_idx]))
                 if not self.graph.is_blocked(current_pos):
                     if current_pos not in next_vertices:
                         next_vertices = list(next_vertices) + [current_pos]
@@ -162,7 +165,7 @@ class LifelongLaCAMIntegrated:
                         depth=ll_node.depth + 1,
                     )
                     hl_node.constraint_tree.append(child)
-            
+
             # Генерируем новую конфигурацию
             new_config = self.generator.generate(
                 hl_node=hl_node,
@@ -195,7 +198,7 @@ class LifelongLaCAMIntegrated:
                 return path
             
             # Стандартная обработка: проверка explored
-            existing_node = self._explored.get(new_config)
+            existing_node = self._explored.get(self._state_key(new_config, self.goals))
             if existing_node is not None:
                 if self.reinsert:
                     self.open_policy.push(existing_node)
@@ -226,7 +229,7 @@ class LifelongLaCAMIntegrated:
                 parent=hl_node,
             )
             
-            self._explored[new_config] = child_node
+            self._explored[self._state_key(new_config, self.goals)] = child_node
             self.open_policy.push(child_node)
         
         # Не нашли решение
@@ -235,6 +238,14 @@ class LifelongLaCAMIntegrated:
             print(f"   Задач выполнено: {self.completed_tasks_count}")
         
         return None
+    
+    def _state_key(self, config: Configuration, goals_snapshot: Optional[List[int]] = None) -> tuple[Configuration, tuple[int, ...]]:
+        """
+        Ключ для explored: учитываем конфигурацию и актуальные цели,
+        чтобы после смены goal'ов переобход не блокировался старыми узлами.
+        """
+        goals_tuple = tuple(goals_snapshot if goals_snapshot is not None else self.goals)
+        return (config, goals_tuple)
     
     def _check_and_update_goals(self, config: Configuration, verbose: bool) -> bool:
         """

@@ -295,7 +295,7 @@ def test_lifelong_warehouse_four_agents():
         ordering=DistanceOrdering(),
         open_policy=StackOpen(),
         task_callback=task_callback,
-        reinsert=True,
+        reinsert=False,
         max_tasks_per_agent=10,
     )
 
