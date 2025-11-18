@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Optional, Dict, List, Set
+from typing import Optional, Dict, List, Set, Optional as TypingOptional
 
 from core.configuration import Configuration
 from core.constraint import Constraint
@@ -31,6 +31,14 @@ class PIBTGenerator(ConfigGenerator):
         продолжает поиск на high-level.
     """
 
+    def __init__(self):
+        # текущие цели агентов (может подменяться Lifelong LaCAM)
+        self.current_goals: TypingOptional[List[int]] = None
+
+    def set_current_goals(self, goals: List[int]) -> None:
+        """Позволяет LaCAM/Lifelong передавать актуальные цели перед генерацией шага."""
+        self.current_goals = goals
+
     # ------------------------------------------------------------
     # PUBLIC API
     # ------------------------------------------------------------
@@ -40,66 +48,19 @@ class PIBTGenerator(ConfigGenerator):
         constraint: Constraint,
         graph: GraphBase,
     ) -> Optional[Configuration]:
+        forced_moves = self._collect_constraints(constraint)
 
-        old_conf: Configuration = hl_node.config
-        num_agents = old_conf.num_agents()
-        order: List[int] = hl_node.order
+        # 1) Быстрая попытка PIBT
+        conf = self._generate_pibt(hl_node, forced_moves, graph)
+        if conf is not None and self._is_valid_configuration(hl_node.config, conf, graph, forced_moves):
+            return conf
 
-        # 1. Приоритеты агентов:
-        #    pri[agent] = индекс в order; меньший индекс -> более высокий приоритет.
-        pri: List[int] = [0] * num_agents
-        for pr, ag in enumerate(order):
-            pri[ag] = pr
+        # 2) Полный перебор даёт гарантированную полноту LL-шага
+        # conf = self._generate_bruteforce(hl_node, forced_moves, graph)
+        # if conf is not None and self._is_valid_configuration(hl_node.config, conf, graph, forced_moves):
+        #     return conf
 
-        # 2. Собираем positive constraints из LL-цепочки
-        forced_moves: Dict[int, int] = self._collect_constraints(constraint)
-
-        # 3. Таблица занятости в старой конфигурации: pos -> agent
-        pos2agent: Dict[int, int] = {}
-        for agent_id, v in enumerate(old_conf.pos):
-            pos2agent[v] = agent_id
-
-        # 4. Массив новых позиций (результат одного шага)
-        new_pos: List[Optional[int]] = [None] * num_agents
-
-        # 5. Зарезервированные вершины в t+1
-        reserved: Set[int] = set()
-
-        # 6. "Стек" рекурсии для PIBT (для отсечения циклов)
-        in_stack: Set[int] = set()
-
-        # 7. Основной проход PIBT по приоритетам
-        for agent in order:
-            if new_pos[agent] is not None:
-                # уже спланировали в рамках другого рекурсивного вызова
-                continue
-
-            if not self._pibt_dfs(
-                agent=agent,
-                old_conf=old_conf,
-                new_pos=new_pos,
-                reserved=reserved,
-                forced_moves=forced_moves,
-                pri=pri,
-                pos2agent=pos2agent,
-                in_stack=in_stack,
-                graph=graph,
-            ):
-                # PIBT не смог найти план для этого агента (и рекурсивно
-                # для тех, кого он пытался сдвинуть) → вся попытка неудачна.
-                return None
-
-        # 8. Проверка: все ли агенты спланированы
-        for a in range(num_agents):
-            if new_pos[a] is None:
-                return None
-
-        # 9. Дополнительная проверка edge-коллизий (на всякий случай)
-        if self._has_edge_conflict(old_conf.pos, new_pos):
-            return None
-
-        # 10. Возвращаем новую конфигурацию
-        return Configuration(tuple(new_pos))  # type: ignore[arg-type]
+        return None
 
     # ------------------------------------------------------------
     # INTERNAL: PIBT recursion
@@ -146,8 +107,18 @@ class PIBTGenerator(ConfigGenerator):
             # включаем stay
             if not graph.is_blocked(cur_v) and cur_v not in neigh:
                 neigh.append(cur_v)
-            # глупый порядок: как есть. Можно сортировать по дист. до цели.
-            candidates = neigh
+
+            # сортировка по эвристике: ближе к цели → раньше
+            if self.current_goals is not None:
+                goal = self.current_goals[agent]
+
+                def _heur(v: int) -> int:
+                    d = graph.dist(v, goal)
+                    return d if d >= 0 else 10**9
+
+                candidates = sorted(neigh, key=_heur)
+            else:
+                candidates = neigh
 
         # 2) Пытаемся каждый кандидат
         for v in candidates:
@@ -241,6 +212,148 @@ class PIBTGenerator(ConfigGenerator):
         # new_pos[agent] так и не был установлен, reserved не меняли
         in_stack.remove(agent)
         return False
+
+    # ------------------------------------------------------------
+    # PIBT core (выделено для возможности fallback)
+    # ------------------------------------------------------------
+    def _generate_pibt(
+        self,
+        hl_node: HLNode,
+        forced_moves: Dict[int, int],
+        graph: GraphBase,
+    ) -> Optional[Configuration]:
+        old_conf: Configuration = hl_node.config
+        num_agents = old_conf.num_agents()
+        order: List[int] = hl_node.order
+
+        pri: List[int] = [0] * num_agents
+        for pr, ag in enumerate(order):
+            pri[ag] = pr
+
+        pos2agent: Dict[int, int] = {}
+        for agent_id, v in enumerate(old_conf.pos):
+            pos2agent[v] = agent_id
+
+        new_pos: List[Optional[int]] = [None] * num_agents
+        reserved: Set[int] = set()
+        in_stack: Set[int] = set()
+
+        for agent in order:
+            if new_pos[agent] is not None:
+                continue
+            if not self._pibt_dfs(
+                agent=agent,
+                old_conf=old_conf,
+                new_pos=new_pos,
+                reserved=reserved,
+                forced_moves=forced_moves,
+                pri=pri,
+                pos2agent=pos2agent,
+                in_stack=in_stack,
+                graph=graph,
+            ):
+                return None
+
+        for a in range(num_agents):
+            if new_pos[a] is None:
+                return None
+
+        if self._has_edge_conflict(old_conf.pos, new_pos):
+            return None
+
+        return Configuration(tuple(new_pos))  # type: ignore[arg-type]
+
+    # ------------------------------------------------------------
+    # Полный перебор одного шага (stay+соседи) для всех агентов
+    # ------------------------------------------------------------
+    def _generate_bruteforce(
+        self,
+        hl_node: HLNode,
+        forced: Dict[int, int],
+        graph: GraphBase,
+    ) -> Optional[Configuration]:
+        old_conf: Configuration = hl_node.config
+        num_agents = old_conf.num_agents()
+
+        # список кандидатов на ход для каждого агента
+        cand_lists: List[List[int]] = []
+        for aid in range(num_agents):
+            cur = old_conf[aid]
+            if aid in forced:
+                cand_lists.append([forced[aid]])
+            else:
+                neigh = list(graph.neighbors(cur))
+                if not graph.is_blocked(cur) and cur not in neigh:
+                    neigh.append(cur)
+                # приоритет по дистанции до цели, если есть
+                if self.current_goals is not None:
+                    goal = self.current_goals[aid]
+                    neigh.sort(key=lambda v: graph.dist(v, goal) if graph.dist(v, goal) >= 0 else 10**9)
+                cand_lists.append(neigh)
+
+        # DFS по комбинациям
+        new_pos = [None] * num_agents
+        used = set()
+
+        def dfs(idx: int) -> bool:
+            if idx == num_agents:
+                # edge-конфликты
+                if self._has_edge_conflict(old_conf.pos, new_pos):
+                    return False
+                return True
+            for v in cand_lists[idx]:
+                if graph.is_blocked(v):
+                    continue
+                if v in used:
+                    continue
+                # edge-свап с уже размещёнными
+                conflict = False
+                for j in range(idx):
+                    if old_conf.pos[idx] == new_pos[j] and old_conf.pos[j] == v and old_conf.pos[idx] != old_conf.pos[j]:
+                        conflict = True
+                        break
+                if conflict:
+                    continue
+                used.add(v)
+                new_pos[idx] = v
+                if dfs(idx + 1):
+                    return True
+                used.remove(v)
+                new_pos[idx] = None
+            return False
+
+        if dfs(0):
+            return Configuration(tuple(new_pos))  # type: ignore[arg-type]
+        return None
+
+    def _is_valid_configuration(
+        self,
+        old_conf: Configuration,
+        new_conf: Configuration,
+        graph: GraphBase,
+        forced_moves: Dict[int, int],
+    ) -> bool:
+        """
+        Проверка, что найденная конфигурация действительно удовлетворяет
+        LL-ограничениям: нет вершинных/ребровых конфликтов, ходы допустимы,
+        соблюдены положительные ограничения.
+        """
+        # vertex collisions
+        if len(set(new_conf.pos)) != len(new_conf.pos):
+            return False
+
+        # допустимость ходов и positive constraints
+        for aid, (u, v) in enumerate(zip(old_conf.pos, new_conf.pos)):
+            if graph.is_blocked(v):
+                return False
+            if v != u and v not in graph.neighbors(u):
+                return False
+            forced = forced_moves.get(aid)
+            if forced is not None and forced != v:
+                return False
+
+        # edge swaps
+        return not self._has_edge_conflict(old_conf.pos, list(new_conf.pos))
 
     # ------------------------------------------------------------
     # CONSTRAINT UTILS

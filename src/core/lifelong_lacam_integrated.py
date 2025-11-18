@@ -119,24 +119,15 @@ class LifelongLaCAMIntegrated:
         
         while not self.open_policy.empty():
             if max_iterations is not None and iterations >= max_iterations:
-                if verbose:
-                    print(f"⚠️  Достигнут лимит итераций: {max_iterations}")
                 break
             
             iterations += 1
             self.total_iterations = iterations
             
-            if verbose and iterations % 5000 == 0:
-                print(f"  Итерация {iterations}: Open={len(self.open_policy._stack) if hasattr(self.open_policy, '_stack') else '?'}, "
-                      f"Explored={len(self._explored)}, "
-                      f"Задач выполнено={sum(self.completed_tasks_count)}")
-            
             hl_node = self.open_policy.peek()
             
             # Проверка: все ли агенты выполнили достаточно задач?
             if self._check_stopping_condition():
-                if verbose:
-                    print(f"\n✓ Все агенты выполнили по {self.max_tasks_per_agent} задач!")
                 return hl_node.reconstruct_path()
             
             # Стандартная логика LaCAM
@@ -145,7 +136,14 @@ class LifelongLaCAMIntegrated:
                 continue
             
             ll_node = hl_node.constraint_tree.popleft()
-            
+
+            # Перед генерацией шага прокидываем текущие цели в генератор, если поддерживается
+            if hasattr(self.generator, "set_current_goals"):
+                try:
+                    self.generator.set_current_goals(self.goals)
+                except Exception:
+                    pass
+
             # Расширяем constraint tree
             if ll_node.depth < self.num_agents:
                 agent_idx = hl_node.order[ll_node.depth]
@@ -292,4 +290,3 @@ class LifelongLaCAMIntegrated:
             'total_completed_tasks': sum(self.completed_tasks_count),
             'tasks_history': [tasks.copy() for tasks in self.completed_tasks_history],
         }
-

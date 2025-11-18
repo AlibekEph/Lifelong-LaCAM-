@@ -110,6 +110,13 @@ class LaCAM:
             # Берём очередной LL-узел (constraint) из дерева (BFS)
             ll_node = hl_node.constraint_tree.popleft()
 
+            # Перед генерацией шага прокидываем цели, если генератор поддерживает
+            if hasattr(self.generator, "set_current_goals"):
+                try:
+                    self.generator.set_current_goals(self.goals)
+                except Exception:
+                    pass
+
             # Генерируем детей LL-узла (расширяем дерево ограничений),
             # если ещё не назначали ограничения для всех агентов.
             if ll_node.depth <= self.num_agents - 1:
@@ -123,6 +130,7 @@ class LaCAM:
                     # избегаем дубликатов, если граф вдруг содержит петлю
                     if current_pos not in next_vertices:
                         next_vertices = list(next_vertices) + [current_pos]
+                next_vertices.sort(key=lambda v: self.graph.dist(v, self.goals[agent_idx]))
 
                 for u in next_vertices:
                     child = Constraint(

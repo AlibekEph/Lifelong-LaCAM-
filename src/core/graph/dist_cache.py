@@ -2,6 +2,8 @@ from collections import deque
 
 from core.graph.base import GraphBase
 
+
+
 class DistCache:
     def __init__(self, graph: GraphBase):
         self.graph = graph
