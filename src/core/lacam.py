@@ -87,12 +87,12 @@ class LaCAM:
             список конфигураций от старта до цели, если решение найдено,
             иначе None.
         """
-        iterations = 0
-
         while not self.open_policy.empty():
-            if max_iterations is not None and iterations >= max_iterations:
+            # Ограничение теперь считается по числу уникальных HL-конфигураций,
+            # а не по количеству Low-Level расширений (LL-узлов). Иначе поисковое
+            # дерево LL может быстро исчерпать лимит, не попробовав достаточно HL-состояний.
+            if max_iterations is not None and len(self._explored) >= max_iterations:
                 break
-            iterations += 1
 
             # Вариант depth-first: смотрим на верхушку Open, не убирая её,
             # пока не выработается всё LL-дерево (constraint_tree).
@@ -112,7 +112,7 @@ class LaCAM:
 
             # Генерируем детей LL-узла (расширяем дерево ограничений),
             # если ещё не назначали ограничения для всех агентов.
-            if ll_node.depth < self.num_agents:
+            if ll_node.depth <= self.num_agents - 1:
                 agent_idx = hl_node.order[ll_node.depth]  # depth 0 → первый агент
                 current_pos = hl_node.config[agent_idx]
 

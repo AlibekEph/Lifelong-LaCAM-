@@ -187,10 +187,15 @@ class PIBTGenerator(ConfigGenerator):
             # 2.2. Вершина занята другим агентом в старой конфигурации.
             #      Пробуем priority inheritance (если наш приоритет выше).
             if occupant == agent:
-                # сам же и стоит в этой вершине → можно рассматривать как stay,
-                # но сюда мы попадаем только если v == cur_v,
-                # что обработано выше как свободный случай.
-                continue
+                # stay на месте: разрешаем его, если нет edge-конфликта
+                if self._check_edge_conflicts_local(agent, cur_v, v, old_conf.pos, new_pos):
+                    in_stack.remove(agent)
+                    return False
+
+                new_pos[agent] = v
+                reserved.add(v)
+                in_stack.remove(agent)
+                return True
 
             # Если наш приоритет НЕ выше → не можем "пинать" occupant.
             if pri[agent] >= pri[occupant]:
