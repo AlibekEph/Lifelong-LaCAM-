@@ -58,9 +58,9 @@ class PIBTGenerator(ConfigGenerator):
             return conf
 
         # 2) Полный перебор даёт гарантированную полноту LL-шага
-        # conf = self._generate_bruteforce(hl_node, forced_moves, graph)
-        # if conf is not None and self._is_valid_configuration(hl_node.config, conf, graph, forced_moves):
-        #     return conf
+        conf = self._generate_bruteforce(hl_node, forced_moves, graph)
+        if conf is not None and self._is_valid_configuration(hl_node.config, conf, graph, forced_moves):
+            return conf
 
         return None
 
@@ -313,7 +313,7 @@ class PIBTGenerator(ConfigGenerator):
                         return d
 
                     neigh.sort(key=_heur)
-            cand_lists.append(neigh)
+                cand_lists.append(neigh)
 
         # DFS по комбинациям
         new_pos = [None] * num_agents

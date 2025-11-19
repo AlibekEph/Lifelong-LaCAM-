@@ -20,6 +20,8 @@ class GridGraph(GraphBase):
 
         # заранее вычисляем соседей
         self._neighbors = self._compute_neighbors()
+        # Кэш расстояний: goal -> dist_map
+        self._dist_cache: dict[int, list[int]] = {}
     
     def _compute_neighbors(self):
         neigh = [[] for _ in range(self.V)]
@@ -62,19 +64,19 @@ class GridGraph(GraphBase):
         """
         if u == v:
             return 0
-        
-        dist_map = [-1] * self.V
-        dist_map[v] = 0
-        
-        q = deque([v])
-        while q:
-            curr = q.popleft()
-            for neighbor in self._neighbors[curr]:
-                if dist_map[neighbor] == -1:
-                    dist_map[neighbor] = dist_map[curr] + 1
-                    if neighbor == u:
-                        return dist_map[neighbor]
-                    q.append(neighbor)
-        
-        return -1  # недостижимо
+
+        dist_map = self._dist_cache.get(v)
+        if dist_map is None:
+            dist_map = [-1] * self.V
+            dist_map[v] = 0
+            q = deque([v])
+            while q:
+                curr = q.popleft()
+                for neighbor in self._neighbors[curr]:
+                    if dist_map[neighbor] == -1:
+                        dist_map[neighbor] = dist_map[curr] + 1
+                        q.append(neighbor)
+            self._dist_cache[v] = dist_map
+
+        return dist_map[u]
         

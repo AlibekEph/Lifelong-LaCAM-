@@ -75,6 +75,10 @@ class LifelongLaCAMIntegrated:
         # Статистика выполненных задач
         self.completed_tasks_count = [0] * self.num_agents
         self.completed_tasks_history: List[List[int]] = [[] for _ in range(self.num_agents)]
+        # Флаг: агент уже получил награду за достижение текущей цели
+        self._goal_completion_ack = [False] * self.num_agents
+        # Агент достиг лимита задач и больше не участвует в выдаче целей
+        self._agent_done = [False] * self.num_agents
         
         # Explored таблица
         self._explored: Dict[tuple[Configuration, tuple[int, ...]], HLNode] = {}
@@ -260,27 +264,41 @@ class LifelongLaCAMIntegrated:
         for agent_id in range(self.num_agents):
             current_pos = config[agent_id]
             current_goal = self.goals[agent_id]
-            
-            # Агент достиг своей цели?
-            if current_pos == current_goal:
-                # Назначаем новую цель через callback
-                old_goal = current_goal
-                new_goal = self.task_callback(agent_id, current_pos, old_goal)
-                
-                if new_goal != old_goal:
-                    # Обновляем цель
-                    self.goals[agent_id] = new_goal
-                    
-                    # Статистика
-                    self.completed_tasks_count[agent_id] += 1
-                    self.completed_tasks_history[agent_id].append(old_goal)
-                    self.goal_updates_count += 1
-                    
-                    goals_updated = True
-                    
-                    if verbose:
-                        print(f"    Агент {agent_id}: достиг {old_goal} → новая цель {new_goal} "
-                              f"(всего задач: {self.completed_tasks_count[agent_id]})")
+
+            if self._agent_done[agent_id]:
+                continue
+
+            if current_pos != current_goal:
+                # как только агент покидает цель, можно снова засчитывать достижение
+                self._goal_completion_ack[agent_id] = False
+                continue
+
+            old_goal = current_goal
+            new_goal = self.task_callback(agent_id, current_pos, old_goal)
+
+            # учитываем достижение цели один раз, пока агент не покинет её
+            if not self._goal_completion_ack[agent_id]:
+                self.completed_tasks_count[agent_id] += 1
+                self.completed_tasks_history[agent_id].append(old_goal)
+                self._goal_completion_ack[agent_id] = True
+
+                if verbose:
+                    print(f"    Агент {agent_id}: завершил цель {old_goal} "
+                          f"(всего задач: {self.completed_tasks_count[agent_id]})")
+
+            if self.completed_tasks_count[agent_id] >= self.max_tasks_per_agent:
+                self._agent_done[agent_id] = True
+                # достигнут лимит задач — больше целей не выдаём
+                continue
+
+            if new_goal != old_goal:
+                self.goals[agent_id] = new_goal
+                self.goal_updates_count += 1
+                self._goal_completion_ack[agent_id] = False
+                goals_updated = True
+
+                if verbose:
+                    print(f"    Агент {agent_id}: новая цель {new_goal}")
         
         return goals_updated
     
