@@ -8,8 +8,6 @@ import subprocess
 from pathlib import Path
 from collections import deque
 from typing import List
-import random
-import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -21,18 +19,51 @@ from strategies.ordering.persistent_ordering import PersistentPriorityOrdering
 from strategies.open_policy.stack import StackOpen
 from utils.kiva_loader import layout_to_grid, generate_kiva_tasks
 
-_VIS_EXPORT_ENV = os.environ.get("LACAM_VIS_EXPORT", "")
-_VIS_EXPORT_FLAG = True if _VIS_EXPORT_ENV == "" else _VIS_EXPORT_ENV.lower() in {"1", "true", "yes", "on"}
-_VIS_EXPORT_DIR = os.environ.get("LACAM_VIS_DIR", "vis_outputs")
+# Новая карта (layout) для теста
+NEW_MAP_LAYOUT = [
+    ".......@.........@@.......@.....",
+    ".....................@...@.....@",
+    ".......@@......@..@@......@.....",
+    "...............@.............@..",
+    "@..............@........@.......",
+    ".........@..........@.@.........",
+    "@...@.@.........................",
+    "........@..............@@.......",
+    "..@...@.....@.@@...@......@.....",
+    "........@...@.............@.....",
+    ".................@..............",
+    ".......@@....@......@..........@",
+    "@....@.@...@.@.............@...@",
+    "@........@.@..................@.",
+    "....@..@@.......................",
+    "........@......@....@...........",
+    "@.................@............@",
+    "............................@...",
+    "@@....@........@.@..............",
+    "...@......................@.@...",
+    "....@...........................",
+    "....@.........................@@",
+    "@.............@.......@..@......",
+    "....................@..@.@..@...",
+    ".....@@..............@..........",
+    "................................",
+    ".@............@......@......@..@",
+    ".......@........................",
+    "...@.................@@........",
+    ".........@............@.........",
+    "....@..........@................",
+    "...@...................@........",
+]
+
+def normalize_layout(rows: list[str]) -> list[str]:
+    max_len = max(len(r) for r in rows)
+    return [r.ljust(max_len, ".") for r in rows]
 
 
 def export_visualizer_files(name: str, graph: GridGraph, config_list: list[Configuration]):
-    if not _VIS_EXPORT_FLAG:
-        return None, None
-    os.makedirs(_VIS_EXPORT_DIR, exist_ok=True)
-
-    map_path = os.path.join(_VIS_EXPORT_DIR, f"{name}.map")
-    sol_path = os.path.join(_VIS_EXPORT_DIR, f"{name}.txt")
+    os.makedirs("vis_outputs", exist_ok=True)
+    map_path = os.path.join("vis_outputs", f"{name}.map")
+    sol_path = os.path.join("vis_outputs", f"{name}.txt")
 
     charset = {True: "@", False: "."}
     rows = ["".join(charset[bool(cell)] for cell in graph.grid[r, :]) for r in range(graph.H)]
@@ -56,6 +87,7 @@ def export_visualizer_files(name: str, graph: GridGraph, config_list: list[Confi
 
 def sample_unique_free(graph: GridGraph, num: int, seed: int) -> list[int]:
     import random
+
     rng = random.Random(seed)
     free = [idx for idx in range(graph.num_vertices()) if not graph.is_blocked(idx)]
     assert len(free) >= num, "Недостаточно свободных клеток для стартов"
@@ -71,14 +103,7 @@ def total_moves(path: list[Configuration]) -> int:
     return moves
 
 
-def run_lacam(
-    graph: GridGraph,
-    starts: list[int],
-    tasks: list[list[int]],
-    stop_mode: str,
-    stop_value: int,
-    enable_clustering: bool,
-):
+def run_lacam(graph: GridGraph, starts: list[int], tasks: list[list[int]], stop_mode: str, stop_value: int):
     tasks_runtime = [deque(agent_tasks) for agent_tasks in tasks]
     max_tasks_per_agent = stop_value if stop_mode == "tasks" else max(len(t) for t in tasks)
     initial_goals = [q[0] for q in tasks_runtime]
@@ -99,7 +124,7 @@ def run_lacam(
         task_callback=task_callback,
         reinsert=True,
         max_tasks_per_agent=max_tasks_per_agent,
-        enable_clustering=enable_clustering,
+        enable_clustering=True,
     )
 
     t0 = time.time()
@@ -113,33 +138,20 @@ def run_lacam(
             path = None
     runtime = time.time() - t0
     if path is None:
-        return {
-            "ticks": max_iters,
-            "total_moves": None,
-            "completed_tasks": lacam.get_statistics().get("completed_tasks_per_agent"),
-            "runtime": runtime,
-            "note": "path not found before stop",
-            "path": None,
-        }
+        return {"ticks": max_iters, "total_moves": None, "completed_tasks": lacam.get_statistics().get("completed_tasks_per_agent"), "runtime": runtime}
     ticks = len(path) - 1
+    stats = lacam.get_statistics()
     return {
         "ticks": ticks,
         "total_moves": total_moves(path),
-        "completed_tasks": lacam.get_statistics().get("completed_tasks_per_agent"),
+        "completed_tasks": stats.get("completed_tasks_per_agent"),
         "runtime": runtime,
-        "note": None,
         "path": path,
+        "stats": stats,
     }
 
 
-def run_pypibt(
-    graph: GridGraph,
-    starts: list[int],
-    tasks: list[list[int]],
-    stop_mode: str,
-    stop_value: int,
-    seed: int,
-):
+def run_pypibt(graph: GridGraph, starts: list[int], tasks: list[list[int]], stop_mode: str, stop_value: int, seed: int):
     try:
         from pypibt import PIBT
     except ImportError:
@@ -150,7 +162,7 @@ def run_pypibt(
             typing.TypeAlias = Any  # type: ignore[attr-defined]
         from pypibt import PIBT  # type: ignore
 
-    free_grid = (~graph.grid).astype(bool)  # True=free для pypibt
+    free_grid = (~graph.grid).astype(bool)
     positions = list(starts)
     goals = [agent_tasks[0] for agent_tasks in tasks]
     remaining = [len(agent_tasks) for agent_tasks in tasks]
@@ -193,37 +205,32 @@ def run_pypibt(
             break
 
     runtime = time.time() - t0
+    stats = None
     return {
         "ticks": ticks,
         "total_moves": total_mv,
         "completed_tasks": [len(tasks[aid]) - max(r, 0) for aid, r in enumerate(remaining)],
         "runtime": runtime,
-        "note": None if (stop_mode != "tasks" or all(r <= 0 for r in remaining)) else "stopped by tick limit",
         "path": path,
+        "stats": stats,
     }
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Детерминированный тест с большим числом задач (Kiva)")
-    parser.add_argument("--num-agents", type=int, default=100, help="Количество агентов")
-    parser.add_argument("--tasks-per-agent", type=int, default=5000, help="Число задач на агента")
-    parser.add_argument("--seed", type=int, default=0, help="Сид генерации стартов/задач")
-    parser.add_argument("--solver", choices=["lacam", "pypibt"], default="lacam", help="Выбор решателя")
-    parser.add_argument("--stop-mode", choices=["tasks", "ticks"], default="tasks", help="Правило остановки")
-    parser.add_argument("--ticks-limit", type=int, default=10000, help="Лимит тиков при stop-mode=ticks")
-    parser.add_argument("--no-clustering", action="store_true", help="Отключить кластеризацию (для lacam)")
+    parser = argparse.ArgumentParser(description="Тест на новой карте с двумя солверами")
+    parser.add_argument("--solver", choices=["lacam", "pypibt"], default="pypibt")
+    parser.add_argument("--stop-mode", choices=["tasks", "ticks"], default="ticks")
+    parser.add_argument("--ticks-limit", type=int, default=50)
+    parser.add_argument("--num-agents", type=int, default=3)
+    parser.add_argument("--tasks-per-agent", type=int, default=5)
+    parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
-    data_path = Path("data/kiva_large_tasks.json")
-    assert data_path.exists(), "Сгенерируйте задачи через scripts/generate_kiva_tasks.py"
-    payload = json.loads(data_path.read_text())
-    grid = layout_to_grid(payload["layout"])
+    vis_enabled = os.environ.get("LACAM_VIS_EXPORT", "").lower() in {"", "1", "true", "yes", "on"}
+
+    layout = normalize_layout(NEW_MAP_LAYOUT)
+    grid = layout_to_grid(layout)
     graph = GridGraph(grid)
-
-    # фиксируем RNG для воспроизводимости (PIBTGenerator использует random.shuffle)
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-
     starts = sample_unique_free(graph, args.num_agents, args.seed)
     tasks = generate_kiva_tasks(
         graph=graph,
@@ -231,40 +238,32 @@ def main():
         free_cells=[i for i in range(graph.num_vertices()) if not graph.is_blocked(i)],
         tasks_per_agent=args.tasks_per_agent,
         seed=args.seed,
-        min_goal_distance=4,
+        min_goal_distance=2,
     )
 
     stop_value = args.tasks_per_agent if args.stop_mode == "tasks" else args.ticks_limit
 
     if args.solver == "lacam":
-        result = run_lacam(
-            graph=graph,
-            starts=starts,
-            tasks=tasks,
-            stop_mode=args.stop_mode,
-            stop_value=stop_value,
-            enable_clustering=not args.no_clustering,
-        )
+        result = run_lacam(graph, starts, tasks, args.stop_mode, stop_value)
     else:
-        result = run_pypibt(
-            graph=graph,
-            starts=starts,
-            tasks=tasks,
-            stop_mode=args.stop_mode,
-            stop_value=stop_value,
-            seed=args.seed,
-        )
+        result = run_pypibt(graph, starts, tasks, args.stop_mode, stop_value, args.seed)
 
     print(
         f"[{args.solver}] ticks={result['ticks']}, total_moves={result['total_moves']}, "
-        f"total_completed={sum(result['completed_tasks']) if result['completed_tasks'] else 'n/a'}, "
+        f"total_completed={sum(result['completed_tasks']) if result.get('completed_tasks') else 'n/a'}, "
         f"runtime={result['runtime']:.2f}s"
     )
-    if result.get("note"):
-        print(f"note: {result['note']}")
+    if result.get("stats"):
+        hl = (result["stats"] or {}).get("hl_metrics") or {}
+        print(
+            f"HL: runtime={hl.get('runtime_seconds', 0):.2f}s, "
+            f"nodes={hl.get('hl_nodes_created', 0)}, "
+            f"LL-exp={hl.get('ll_expansions', 0)}, "
+            f"generator={{success:{hl.get('generator_successes', 0)}, fail:{hl.get('generator_failures', 0)}}}"
+        )
 
-    if _VIS_EXPORT_FLAG and result.get("path"):
-        name = f"kiva_bulk_{args.solver}"
+    if vis_enabled and result.get("path"):
+        name = f"new_map_{args.solver}"
         map_path, sol_path = export_visualizer_files(name, graph, result["path"])
         vis_bin = shutil.which("mapf-visualizer-lifelong")
         if vis_bin and map_path and sol_path:
