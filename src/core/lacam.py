@@ -39,6 +39,9 @@ class LaCAM:
     ordering: AgentOrdering
     open_policy: OpenPolicy
     reinsert: bool = True
+    occupancy_penalty: float = 5.0
+    backtrack_penalty: float = 1.0
+    stay_bonus: float = 0.25
 
     def __post_init__(self):
         assert len(self.starts) == len(self.goals), "starts и goals должны совпадать по длине"
@@ -110,6 +113,8 @@ class LaCAM:
             # Берём очередной LL-узел (constraint) из дерева (BFS)
             ll_node = hl_node.constraint_tree.popleft()
 
+            pos_to_agent = {pos: idx for idx, pos in enumerate(hl_node.config.pos)}
+
             # Перед генерацией шага прокидываем цели, если генератор поддерживает
             if hasattr(self.generator, "set_current_goals"):
                 try:
@@ -124,13 +129,19 @@ class LaCAM:
                 current_pos = hl_node.config[agent_idx]
 
                 # соседи + возможность остаться на месте
-                next_vertices: Iterable[int] = list(self.graph.neighbors(current_pos))
-                # stay
-                if not self.graph.is_blocked(current_pos):
-                    # избегаем дубликатов, если граф вдруг содержит петлю
-                    if current_pos not in next_vertices:
-                        next_vertices = list(next_vertices) + [current_pos]
-                next_vertices.sort(key=lambda v: self.graph.dist(v, self.goals[agent_idx]))
+                next_vertices: list[int] = list(self.graph.neighbors(current_pos))
+                if not self.graph.is_blocked(current_pos) and current_pos not in next_vertices:
+                    next_vertices.append(current_pos)
+
+                next_vertices.sort(
+                    key=lambda v: self._constraint_score(
+                        hl_node=hl_node,
+                        agent_idx=agent_idx,
+                        current_pos=current_pos,
+                        candidate=v,
+                        pos_to_agent=pos_to_agent,
+                    )
+                )
 
                 for u in next_vertices:
                     child = Constraint(
@@ -190,3 +201,31 @@ class LaCAM:
 
         # Если дошли сюда — решения нет (или вышли по max_iterations)
         return None
+
+    def _constraint_score(
+        self,
+        hl_node: HLNode,
+        agent_idx: int,
+        current_pos: int,
+        candidate: int,
+        pos_to_agent: dict[int, int],
+    ) -> float:
+        goal = self.goals[agent_idx]
+        dist = self.graph.dist(candidate, goal)
+        if dist < 0:
+            dist = float(self.graph.num_vertices())
+
+        penalty = 0.0
+        if candidate == current_pos:
+            penalty -= self.stay_bonus
+        else:
+            occupant = pos_to_agent.get(candidate)
+            if occupant is not None and occupant != agent_idx:
+                penalty += self.occupancy_penalty
+
+        if hl_node.parent is not None:
+            prev_pos = hl_node.parent.config[agent_idx]
+            if candidate == prev_pos and candidate != goal:
+                penalty += self.backtrack_penalty
+
+        return dist + penalty

@@ -1,5 +1,9 @@
 from __future__ import annotations
 from typing import Optional, Dict, List, Set, Optional as TypingOptional
+from collections import Counter
+from math import ceil
+import time
+import random
 
 from core.configuration import Configuration
 from core.constraint import Constraint
@@ -36,6 +40,29 @@ class PIBTGenerator(ConfigGenerator):
         self.current_goals: TypingOptional[List[int]] = None
         # глобальный счётчик тактов для круговой ротации приоритетов (PIBT)
         self._time_step: int = 0
+        # накапливаем динамические приоритеты (кто дольше ждёт цели)
+        self._priority_offsets: TypingOptional[List[float]] = None
+        # собираем статистику работы генератора
+        self._metrics = {
+            "generate_calls": 0,
+            "pibt_calls": 0,
+            "pibt_success": 0,
+            "pibt_failures": 0,
+            "bruteforce_calls": 0,
+            "bruteforce_success": 0,
+            "bruteforce_failures": 0,
+            "pibt_time": 0.0,
+            "bruteforce_time": 0.0,
+        }
+        self._stack_depth_hist: Counter[int] = Counter()
+        self._stack_depth_count: int = 0
+        self._stack_depth_sum: int = 0
+        self._stack_depth_max: int = 0
+        # эвристические параметры
+        self.occupancy_penalty: float = 5.0
+        self.stay_bonus: float = 0.25
+        # запоминаем последнюю позицию для приоритетного буста за "застревание"
+        self._last_positions: TypingOptional[List[int]] = None
 
     def set_current_goals(self, goals: List[int]) -> None:
         """Позволяет LaCAM/Lifelong передавать актуальные цели перед генерацией шага."""
@@ -50,19 +77,104 @@ class PIBTGenerator(ConfigGenerator):
         constraint: Constraint,
         graph: GraphBase,
     ) -> Optional[Configuration]:
-        forced_moves = self._collect_constraints(constraint)
+        self._metrics["generate_calls"] += 1
+        forced_moves, forced_order = self._collect_constraints(constraint)
+        self._ensure_priority_vector(hl_node.config.num_agents())
 
         # 1) Быстрая попытка PIBT
-        conf = self._generate_pibt(hl_node, forced_moves, graph)
+        self._metrics["pibt_calls"] += 1
+        start = time.perf_counter()
+        conf = self._generate_pibt(hl_node, forced_moves, forced_order, graph)
+        self._metrics["pibt_time"] += time.perf_counter() - start
         if conf is not None and self._is_valid_configuration(hl_node.config, conf, graph, forced_moves):
+            self._metrics["pibt_success"] += 1
+            self._update_priority_offsets(conf)
             return conf
+        else:
+            self._metrics["pibt_failures"] += 1
 
         # 2) Полный перебор даёт гарантированную полноту LL-шага
-        conf = self._generate_bruteforce(hl_node, forced_moves, graph)
+        self._metrics["bruteforce_calls"] += 1
+        start = time.perf_counter()
+        conf = self._generate_bruteforce(hl_node, forced_moves, forced_order, graph)
+        self._metrics["bruteforce_time"] += time.perf_counter() - start
         if conf is not None and self._is_valid_configuration(hl_node.config, conf, graph, forced_moves):
+            self._metrics["bruteforce_success"] += 1
+            self._update_priority_offsets(conf)
             return conf
+        else:
+            self._metrics["bruteforce_failures"] += 1
 
         return None
+
+    def get_metrics(self) -> Dict[str, int]:
+        """Вернуть собранные метрики генератора."""
+        metrics = dict(self._metrics)
+        # средние времена PIBT/Bruteforce
+        metrics["pibt_avg_time"] = (
+            self._metrics["pibt_time"] / self._metrics["pibt_calls"]
+            if self._metrics["pibt_calls"] > 0 else 0.0
+        )
+        metrics["bruteforce_avg_time"] = (
+            self._metrics["bruteforce_time"] / self._metrics["bruteforce_calls"]
+            if self._metrics["bruteforce_calls"] > 0 else 0.0
+        )
+
+        if self._stack_depth_count > 0:
+            metrics["stack_depth"] = {
+                "count": self._stack_depth_count,
+                "avg": self._stack_depth_sum / self._stack_depth_count,
+                "max": self._stack_depth_max,
+                "p50": self._stack_percentile(0.5),
+                "p90": self._stack_percentile(0.9),
+                "p99": self._stack_percentile(0.99),
+            }
+        else:
+            metrics["stack_depth"] = {
+                "count": 0,
+                "avg": 0,
+                "max": 0,
+                "p50": 0,
+                "p90": 0,
+                "p99": 0,
+            }
+        return metrics
+
+    def _record_stack_depth(self, depth: int) -> None:
+        self._stack_depth_hist[depth] += 1
+        self._stack_depth_count += 1
+        self._stack_depth_sum += depth
+        if depth > self._stack_depth_max:
+            self._stack_depth_max = depth
+
+    def _stack_percentile(self, q: float) -> int:
+        if self._stack_depth_count == 0:
+            return 0
+        threshold = ceil(q * self._stack_depth_count)
+        cum = 0
+        for depth in sorted(self._stack_depth_hist.keys()):
+            cum += self._stack_depth_hist[depth]
+            if cum >= threshold:
+                return depth
+        return self._stack_depth_max
+
+    def _ensure_priority_vector(self, num_agents: int) -> None:
+        if self._priority_offsets is None or len(self._priority_offsets) != num_agents:
+            self._priority_offsets = [0.0 for _ in range(num_agents)]
+
+    def _update_priority_offsets(self, new_conf: Configuration) -> None:
+        if self.current_goals is None or self._priority_offsets is None:
+            return
+        if self._last_positions is None or len(self._last_positions) != len(new_conf.pos):
+            self._last_positions = list(new_conf.pos)
+        for aid, pos in enumerate(new_conf.pos):
+            goal = self.current_goals[aid]
+            if pos == goal:
+                self._priority_offsets[aid] = 0.0
+            else:
+                stuck_bonus = 1.0 if self._last_positions[aid] == pos else 0.0
+                self._priority_offsets[aid] += 1.0 + stuck_bonus
+            self._last_positions[aid] = pos
 
     # ------------------------------------------------------------
     # INTERNAL: PIBT recursion
@@ -97,6 +209,7 @@ class PIBTGenerator(ConfigGenerator):
         if agent in in_stack:
             return False
         in_stack.add(agent)
+        self._record_stack_depth(len(in_stack))
 
         cur_v = old_conf[agent]
 
@@ -106,6 +219,7 @@ class PIBTGenerator(ConfigGenerator):
             candidates = [forced_moves[agent]]
         else:
             neigh = list(graph.neighbors(cur_v))
+            random.shuffle(neigh)
             has_stay = False
             # включаем stay
             if not graph.is_blocked(cur_v) and cur_v not in neigh:
@@ -120,7 +234,16 @@ class PIBTGenerator(ConfigGenerator):
                     d = graph.dist(v, goal)
                     if d < 0:
                         d = 10**9
-                    return d
+                    penalty = 0.0
+                    if v == cur_v:
+                        penalty -= self.stay_bonus
+                    else:
+                        occ = pos2agent.get(v)
+                        if occ is not None and (new_pos[occ] is None or new_pos[occ] == v):
+                            penalty += self.occupancy_penalty
+                        if v in reserved:
+                            penalty += self.occupancy_penalty
+                    return d + penalty
 
                 # сортируем движущиеся кандидаты, stay добавим в конец
                 move_candidates = sorted([v for v in neigh if v != cur_v], key=_heur)
@@ -178,7 +301,7 @@ class PIBTGenerator(ConfigGenerator):
                 return True
 
             # Если наш приоритет НЕ выше → не можем "пинать" occupant.
-            if pri[agent] > pri[occupant]:
+            if pri[agent] >= pri[occupant]:
                 continue
 
             # Если occupant уже в рекурсивном стеке → цикл, пропускаем
@@ -229,15 +352,33 @@ class PIBTGenerator(ConfigGenerator):
         self,
         hl_node: HLNode,
         forced_moves: Dict[int, int],
+        forced_order: List[int],
         graph: GraphBase,
     ) -> Optional[Configuration]:
         old_conf: Configuration = hl_node.config
         num_agents = old_conf.num_agents()
         order: List[int] = hl_node.order
 
-        # Круговая ротация приоритетов по глобальному времени (PIBT rule)
-        offset = self._time_step % num_agents if num_agents > 0 else 0
-        rotated = order[offset:] + order[:offset]
+        base_rank: Dict[int, int] = {}
+        for idx, ag in enumerate(order):
+            base_rank[ag] = idx
+        forced_index: Dict[int, int] = {ag: idx for idx, ag in enumerate(forced_order)}
+
+        priority_offsets = self._priority_offsets or [0.0 for _ in range(num_agents)]
+        forced_bonus = num_agents + len(forced_index)
+        effective_priority: List[float] = [0.0] * num_agents
+        for ag in range(num_agents):
+            rank = base_rank.get(ag, num_agents + ag)
+            eff = rank - priority_offsets[ag]
+            idx = forced_index.get(ag)
+            if idx is not None:
+                eff -= (forced_bonus - idx)
+            effective_priority[ag] = eff
+
+        rotated = sorted(
+            list(range(num_agents)),
+            key=lambda ag: (effective_priority[ag], base_rank.get(ag, num_agents + ag), ag),
+        )
 
         pri: List[int] = [0] * num_agents
         for pr, ag in enumerate(rotated):
@@ -286,17 +427,18 @@ class PIBTGenerator(ConfigGenerator):
         self,
         hl_node: HLNode,
         forced: Dict[int, int],
+        forced_order: List[int],
         graph: GraphBase,
     ) -> Optional[Configuration]:
         old_conf: Configuration = hl_node.config
         num_agents = old_conf.num_agents()
 
         # список кандидатов на ход для каждого агента
-        cand_lists: List[List[int]] = []
+        cand_lists: List[List[int]] = [[] for _ in range(num_agents)]
         for aid in range(num_agents):
             cur = old_conf[aid]
             if aid in forced:
-                cand_lists.append([forced[aid]])
+                cand_lists[aid] = [forced[aid]]
             else:
                 neigh = list(graph.neighbors(cur))
                 if not graph.is_blocked(cur) and cur not in neigh:
@@ -313,37 +455,58 @@ class PIBTGenerator(ConfigGenerator):
                         return d
 
                     neigh.sort(key=_heur)
-                cand_lists.append(neigh)
+                cand_lists[aid] = neigh
+
+        forced_seen: Set[int] = set()
+        order_seq: List[int] = []
+        for aid in forced_order:
+            if aid not in forced_seen:
+                order_seq.append(aid)
+                forced_seen.add(aid)
+        for aid in hl_node.order:
+            if aid not in forced_seen:
+                order_seq.append(aid)
+                forced_seen.add(aid)
+        for aid in range(num_agents):
+            if aid not in forced_seen:
+                order_seq.append(aid)
+                forced_seen.add(aid)
 
         # DFS по комбинациям
         new_pos = [None] * num_agents
         used = set()
 
         def dfs(idx: int) -> bool:
-            if idx == num_agents:
+            if idx == len(order_seq):
                 # edge-конфликты
                 if self._has_edge_conflict(old_conf.pos, new_pos):
                     return False
                 return True
-            for v in cand_lists[idx]:
+            agent = order_seq[idx]
+            for v in cand_lists[agent]:
                 if graph.is_blocked(v):
                     continue
                 if v in used:
                     continue
                 # edge-свап с уже размещёнными
                 conflict = False
+                cur_pos = old_conf.pos[agent]
                 for j in range(idx):
-                    if old_conf.pos[idx] == new_pos[j] and old_conf.pos[j] == v and old_conf.pos[idx] != old_conf.pos[j]:
+                    other_agent = order_seq[j]
+                    other_new = new_pos[other_agent]
+                    if other_new is None:
+                        continue
+                    if cur_pos == other_new and old_conf.pos[other_agent] == v and cur_pos != old_conf.pos[other_agent]:
                         conflict = True
                         break
                 if conflict:
                     continue
                 used.add(v)
-                new_pos[idx] = v
+                new_pos[agent] = v
                 if dfs(idx + 1):
                     return True
                 used.remove(v)
-                new_pos[idx] = None
+                new_pos[agent] = None
             return False
 
         if dfs(0):
@@ -382,17 +545,22 @@ class PIBTGenerator(ConfigGenerator):
     # ------------------------------------------------------------
     # CONSTRAINT UTILS
     # ------------------------------------------------------------
-    def _collect_constraints(self, constraint: Constraint) -> Dict[int, int]:
+    def _collect_constraints(self, constraint: Constraint) -> tuple[Dict[int, int], List[int]]:
         """
         Собрать все positive constraints (who -> where) из цепочки
         LL-узлов, начиная от constraint и поднимаясь к корню.
         """
         forced: Dict[int, int] = {}
+        order: List[int] = []
+        node_chain: List[Constraint] = []
         node = constraint
         while node is not None and node.who is not None:
-            forced[node.who] = node.where  # type: ignore[assignment]
+            node_chain.append(node)
             node = node.parent
-        return forced
+        for constrained in reversed(node_chain):
+            forced[constrained.who] = constrained.where  # type: ignore[assignment]
+            order.append(constrained.who)
+        return forced, order
 
     # ------------------------------------------------------------
     # EDGE CONFLICT CHECKS

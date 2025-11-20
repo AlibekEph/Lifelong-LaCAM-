@@ -3,9 +3,10 @@ import sys
 import json
 import shutil
 import subprocess
+import argparse
 from pathlib import Path
 from collections import deque
-
+import time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import numpy as np
@@ -13,7 +14,7 @@ import numpy as np
 from core.graph.grid import GridGraph
 from core.lifelong_lacam_integrated import LifelongLaCAMIntegrated
 from strategies.generators.pibt import PIBTGenerator
-from strategies.ordering.distance_ordering import DistanceOrdering
+from strategies.ordering.persistent_ordering import PersistentPriorityOrdering
 from strategies.open_policy.stack import StackOpen
 from utils.kiva_loader import layout_to_grid, coords_to_indices
 
@@ -83,7 +84,47 @@ def _validate_plan(graph: GridGraph, configs: list, starts: list[int]):
                     raise AssertionError(f"Edge swap между агентами {i} и {j} на шаге {step}")
 
 
-def test_lifelong_kiva_large_tasks():
+def _pretty_print_metrics(stats: dict, label: str = ""):
+    prefix = f"[{label}] " if label else ""
+    hl = stats.get("hl_metrics") or {}
+    runtime = hl.get("runtime_seconds")
+    runtime_str = f"{runtime:.2f}s" if runtime is not None else "n/a"
+    print(f"{prefix}HL metrics:")
+    print(
+        f"  runtime={runtime_str}, "
+        f"nodes={hl.get('hl_nodes_created', 0)}, "
+        f"revisited={hl.get('hl_revisited_nodes', 0)}, "
+        f"iterations={hl.get('iterations', 0)}, "
+        f"goal_updates={stats.get('goal_updates', 0)}"
+    )
+    print(
+        f"  LL-nodes={hl.get('ll_nodes_created', 0)}, "
+        f"max_queue={hl.get('max_constraint_queue', 0)}, "
+        f"LL-expansions={hl.get('ll_expansions', 0)}, "
+        f"generator={{success:{hl.get('generator_successes', 0)}, fail:{hl.get('generator_failures', 0)}}}"
+    )
+
+    gen = stats.get("generator_metrics") or {}
+    stack = gen.get("stack_depth") or {}
+    print(f"{prefix}PIBT metrics:")
+    print(
+        f"  generate={gen.get('generate_calls', 0)}, "
+        f"pibt={{success:{gen.get('pibt_success', 0)}, fail:{gen.get('pibt_failures', 0)}, "
+        f"time:{gen.get('pibt_time', 0.0):.2f}s, avg:{gen.get('pibt_avg_time', 0.0):.4f}s}}, "
+        f"bruteforce={{success:{gen.get('bruteforce_success', 0)}, fail:{gen.get('bruteforce_failures', 0)}, "
+        f"time:{gen.get('bruteforce_time', 0.0):.2f}s, avg:{gen.get('bruteforce_avg_time', 0.0):.4f}s}}"
+    )
+    if stack:
+        print(
+            f"  stack-depth: avg={stack.get('avg', 0):.2f}, "
+            f"max={stack.get('max', 0)}, "
+            f"p50={stack.get('p50', 0)}, "
+            f"p90={stack.get('p90', 0)}, "
+            f"p99={stack.get('p99', 0)}"
+        )
+
+
+def test_lifelong_kiva_large_tasks(num_agents: int = 10):
     data_path = Path("data/kiva_large_tasks.json")
     assert data_path.exists(), "Сгенерируйте задачи через scripts/generate_kiva_tasks.py"
     payload = json.loads(data_path.read_text())
@@ -92,14 +133,15 @@ def test_lifelong_kiva_large_tasks():
     grid = layout_to_grid(layout)
     graph = GridGraph(grid)
 
-    agents_to_use = 10
+    agents_to_use = num_agents
     starts_coords = payload["starts"][:agents_to_use]
     tasks_coords_list = payload["tasks"][:agents_to_use]
-    print(starts_coords)
     starts = coords_to_indices(graph, starts_coords)
     tasks_list = [coords_to_indices(graph, coords) for coords in tasks_coords_list]
     assert len(starts) == len(tasks_list)
     tasks_per_agent = payload.get("tasks_per_agent", len(tasks_list[0]))
+    print(tasks_per_agent)
+
     assert tasks_per_agent >= 100, "Нужно минимум 100 задач на агента"
 
     tasks_runtime = [deque(agent_tasks) for agent_tasks in tasks_list]
@@ -117,18 +159,22 @@ def test_lifelong_kiva_large_tasks():
         starts=starts,
         initial_goals=initial_goals,
         generator=PIBTGenerator(),
-        ordering=DistanceOrdering(),
+        ordering=PersistentPriorityOrdering(1, 3),
         open_policy=StackOpen(),
         task_callback=task_callback,
         reinsert=True,
         max_tasks_per_agent=tasks_per_agent,
     )
 
+    start = time.time()
     path = lacam.run(max_iterations=2_000_000, verbose=False)
+    duration = time.time() - start
     assert path is not None, "План не найден"
     _validate_plan(graph, path, starts)
     stats = lacam.get_statistics()
+    print(f"[kiva] solved in {duration:.2f}s")
     assert all(x >= tasks_per_agent for x in stats["completed_tasks_per_agent"])
+    _pretty_print_metrics(stats, label="kiva")
 
     if _VIS_EXPORT_FLAG:
         map_path, _ = export_visualizer_files("test_kiva_large_lifelong", graph, path)
@@ -165,4 +211,18 @@ def test_lifelong_kiva_large_tasks():
 
 
 if __name__ == "__main__":
-    test_lifelong_kiva_large_tasks()
+    parser = argparse.ArgumentParser(description="Тест lifelong MAPF на Kiva layout")
+    parser.add_argument(
+        "--num-agents",
+        type=int,
+        default=10,
+        help="Количество агентов для запуска (по умолчанию: 10)"
+    )
+    parser.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="Тихий режим (сокращённый вывод)"
+    )
+    args = parser.parse_args()
+    test_lifelong_kiva_large_tasks(num_agents=args.num_agents)

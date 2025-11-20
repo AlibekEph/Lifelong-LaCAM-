@@ -1,13 +1,13 @@
 from __future__ import annotations
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Optional, Set
 from collections import deque
 
 from .configuration import Configuration
 from .constraint import Constraint
 
 
-@dataclass
+@dataclass(eq=False)
 class HLNode:
     """
     High-Level Node (HL-node) в алгоритме LaCAM.
@@ -25,12 +25,16 @@ class HLNode:
 
         parent           : HLNode | None
             Родительский HL-узел (для восстановления пути).
+        neighbors        : set[HLNode]
+            Соседние HL-узлы (для переиспользования конфигураций).
     """
 
     config: Configuration
     constraint_tree: deque[Constraint]
     order: list[int]
     parent: Optional["HLNode"]
+    cost_from_parent: int = 0
+    neighbors: Set["HLNode"] = field(default_factory=set)
 
     def is_goal(self, goal_config: Configuration) -> bool:
         """Проверка: достигли ли мы конфигурации целей."""
