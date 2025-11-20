@@ -6,6 +6,7 @@ import subprocess
 import argparse
 from pathlib import Path
 from collections import deque
+from typing import Optional
 import time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -124,7 +125,22 @@ def _pretty_print_metrics(stats: dict, label: str = ""):
         )
 
 
-def test_lifelong_kiva_large_tasks(num_agents: int = 10):
+def _repeat_to_length(seq: list[int], target: int) -> list[int]:
+    if not seq:
+        raise ValueError("Empty task sequence")
+    if len(seq) >= target:
+        return seq[:target]
+    repeated: list[int] = []
+    while len(repeated) < target:
+        repeated.extend(seq)
+    return repeated[:target]
+
+
+def test_lifelong_kiva_large_tasks(
+    num_agents: int = 10,
+    enable_clustering: bool = True,
+    tasks_per_agent_override: Optional[int] = None,
+):
     data_path = Path("data/kiva_large_tasks.json")
     assert data_path.exists(), "Сгенерируйте задачи через scripts/generate_kiva_tasks.py"
     payload = json.loads(data_path.read_text())
@@ -137,13 +153,16 @@ def test_lifelong_kiva_large_tasks(num_agents: int = 10):
     starts_coords = payload["starts"][:agents_to_use]
     tasks_coords_list = payload["tasks"][:agents_to_use]
     starts = coords_to_indices(graph, starts_coords)
-    tasks_list = [coords_to_indices(graph, coords) for coords in tasks_coords_list]
-    assert len(starts) == len(tasks_list)
-    tasks_per_agent = payload.get("tasks_per_agent", len(tasks_list[0]))
-    print(tasks_per_agent)
+    base_tasks = [coords_to_indices(graph, coords) for coords in tasks_coords_list]
+    assert len(starts) == len(base_tasks)
+    tasks_per_agent = tasks_per_agent_override if tasks_per_agent_override is not None else payload.get(
+        "tasks_per_agent",
+        len(base_tasks[0]),
+    )
+    assert tasks_per_agent > 0, "Число задач на агента должно быть > 0"
+    print(f"tasks_per_agent={tasks_per_agent}")
 
-    assert tasks_per_agent >= 100, "Нужно минимум 100 задач на агента"
-
+    tasks_list = [_repeat_to_length(agent_tasks, tasks_per_agent) for agent_tasks in base_tasks]
     tasks_runtime = [deque(agent_tasks) for agent_tasks in tasks_list]
     tasks_for_episodes = [deque(agent_tasks) for agent_tasks in tasks_list]
     initial_goals = [q[0] for q in tasks_runtime]
@@ -164,6 +183,7 @@ def test_lifelong_kiva_large_tasks(num_agents: int = 10):
         task_callback=task_callback,
         reinsert=True,
         max_tasks_per_agent=tasks_per_agent,
+        enable_clustering=enable_clustering,
     )
 
     start = time.time()
@@ -224,5 +244,21 @@ if __name__ == "__main__":
         action="store_true",
         help="Тихий режим (сокращённый вывод)"
     )
+    parser.add_argument(
+        "--no-clustering",
+        action="store_true",
+        help="Отключить кластеризацию LL-шага",
+    )
+    parser.add_argument(
+        "--tasks-per-agent",
+        type=int,
+        default=None,
+        help="Количество задач на агента (override payload, по умолчанию берётся из kiva_large_tasks.json)",
+    )
     args = parser.parse_args()
-    test_lifelong_kiva_large_tasks(num_agents=args.num_agents)
+    lacam_clustering = not args.no_clustering
+    test_lifelong_kiva_large_tasks(
+        num_agents=args.num_agents,
+        enable_clustering=lacam_clustering,
+        tasks_per_agent_override=args.tasks_per_agent,
+    )

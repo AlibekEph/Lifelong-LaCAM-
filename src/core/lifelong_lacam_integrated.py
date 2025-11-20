@@ -66,6 +66,8 @@ class LifelongLaCAMIntegrated:
     occupancy_penalty: float = 5.0
     backtrack_penalty: float = 1.0
     stay_bonus: float = 0.25
+    enable_clustering: bool = True
+    cluster_radius: int = 1
     
     def __post_init__(self):
         assert len(self.starts) == len(self.initial_goals)
@@ -94,6 +96,11 @@ class LifelongLaCAMIntegrated:
             'generator_successes': 0,
             'iterations': 0,
             'runtime_seconds': 0.0,
+            'cluster_attempts': 0,
+            'cluster_successes': 0,
+            'cluster_fallbacks': 0,
+            'max_clusters': 1,
+            'max_cluster_size': self.num_agents,
         }
         
         # Explored таблица
@@ -108,6 +115,7 @@ class LifelongLaCAMIntegrated:
             goals=self.goals,
             graph=self.graph,
         )
+        init_order = self._demote_done_agents(init_order)
         
         root_node = HLNode(
             config=self.start_config,
@@ -203,12 +211,21 @@ class LifelongLaCAMIntegrated:
                             len(hl_node.constraint_tree),
                         )
 
-                # Генерируем новую конфигурацию
-                new_config = self.generator.generate(
-                    hl_node=hl_node,
-                    constraint=ll_node,
-                    graph=self.graph,
-                )
+                # Генерируем новую конфигурацию (сначала пробуем кластеризацию)
+                new_config = None
+                if self.enable_clustering:
+                    new_config = self._generate_clustered_step(
+                        hl_node=hl_node,
+                        ll_node=ll_node,
+                        graph=self.graph,
+                    )
+
+                if new_config is None:
+                    new_config = self.generator.generate(
+                        hl_node=hl_node,
+                        constraint=ll_node,
+                        graph=self.graph,
+                    )
                 
                 if new_config is None:
                     self._hl_metrics['generator_failures'] += 1
@@ -269,6 +286,7 @@ class LifelongLaCAMIntegrated:
                     graph=self.graph,
                     goals=self.goals,  
                 )
+                new_order = self._demote_done_agents(new_order)
                 
                 edge_cost = self.get_edge_cost(hl_node.config, new_config)
 
@@ -301,6 +319,184 @@ class LifelongLaCAMIntegrated:
         """
         goals_tuple = tuple(goals_snapshot if goals_snapshot is not None else self.goals)
         return (config, goals_tuple)
+
+    def _demote_done_agents(self, order: list[int]) -> list[int]:
+        """
+        Переносит агентов, у которых закончились задания, в конец порядка,
+        чтобы их можно было вытеснять приоритетом PIBT и не держать коридоры.
+        """
+        active = [aid for aid in order if not self._agent_done[aid]]
+        finished = [aid for aid in order if self._agent_done[aid]]
+        return active + finished
+
+    # ------------------------------------------------------------
+    # Кластеры и вспомогательные функции LL
+    # ------------------------------------------------------------
+    def _collect_positive_constraints(self, constraint: Constraint) -> tuple[dict[int, int], list[int], list[Constraint]]:
+        """
+        Собрать все positive constraints (who -> where) из цепочки LL-узлов от корня до constraint.
+        Возвращает:
+            forced_moves: who -> where
+            forced_order: порядок добавления ограничений
+            chain: список Constraint от корня до constraint (включительно)
+        """
+        chain = constraint.path()
+        forced: dict[int, int] = {}
+        order: list[int] = []
+        for node in chain:
+            if node.who is None:
+                continue
+            forced[node.who] = node.where  # type: ignore[assignment]
+            order.append(node.who)
+        return forced, order, chain
+
+    def _clone_constraint_chain(self, base_chain: list[Constraint], extra_forced: list[tuple[int, int]]) -> Constraint:
+        """
+        Склонировать цепочку Constraint (root -> leaf) и добавить дополнительные forced-узлы.
+        Возвращает leaf новой цепочки.
+        """
+        parent: Optional[Constraint] = None
+        depth = 0
+        # корень
+        parent = Constraint(parent=None, who=None, where=None, depth=depth)
+        # основная цепочка (пропускаем старый корень)
+        for node in base_chain[1:]:
+            depth += 1
+            parent = Constraint(parent=parent, who=node.who, where=node.where, depth=depth)
+        # дополнительные ограничения
+        for who, where in extra_forced:
+            depth += 1
+            parent = Constraint(parent=parent, who=who, where=where, depth=depth)
+        return parent
+
+    def _cluster_reachable(self, aid: int, config: Configuration, forced_moves: dict[int, int], graph: GraphBase) -> set[int]:
+        """
+        Множество позиций, способных быть занятых агентом на t+1 (радиус cluster_radius).
+        Используется для определения независимости кластеров.
+        """
+        start = config[aid]
+        target = forced_moves.get(aid, start)
+        reachable = {start, target}
+        frontier = {start}
+        for _ in range(self.cluster_radius):
+            new_frontier = set()
+            for v in frontier:
+                for nb in graph.neighbors(v):
+                    new_frontier.add(nb)
+            reachable |= new_frontier
+            frontier = new_frontier
+        return reachable
+
+    def _compute_clusters(self, config: Configuration, graph: GraphBase, forced_moves: dict[int, int]) -> list[list[int]]:
+        """
+        Разбиение агентов на независимые кластеры: пересечение reachable множеств -> ребро.
+        """
+        n = self.num_agents
+        reach: list[set[int]] = [self._cluster_reachable(aid, config, forced_moves, graph) for aid in range(n)]
+        clusters: list[list[int]] = []
+        unassigned = set(range(n))
+        while unassigned:
+            seed = unassigned.pop()
+            cluster = [seed]
+            queue = [seed]
+            while queue:
+                i = queue.pop()
+                intersect = []
+                for j in list(unassigned):
+                    if reach[i].intersection(reach[j]):
+                        intersect.append(j)
+                for j in intersect:
+                    unassigned.remove(j)
+                    cluster.append(j)
+                    queue.append(j)
+            clusters.append(cluster)
+        return clusters
+
+    def _validate_configuration(
+        self,
+        old_conf: Configuration,
+        new_conf: Configuration,
+        graph: GraphBase,
+        forced_moves: dict[int, int],
+    ) -> bool:
+        """Глобальная проверка корректности шага (вершинные/ребровые коллизии, допустимость ходов, respect forced)."""
+        # vertex collisions
+        if len(set(new_conf.pos)) != len(new_conf.pos):
+            return False
+        # moves and forced
+        for aid, (u, v) in enumerate(zip(old_conf.pos, new_conf.pos)):
+            if graph.is_blocked(v):
+                return False
+            if u != v and v not in graph.neighbors(u):
+                return False
+            forced = forced_moves.get(aid)
+            if forced is not None and forced != v:
+                return False
+        # edge swaps
+        n = len(old_conf.pos)
+        for i in range(n):
+            for j in range(i + 1, n):
+                if old_conf.pos[i] == new_conf.pos[j] and old_conf.pos[j] == new_conf.pos[i] \
+                        and old_conf.pos[i] != old_conf.pos[j]:
+                    return False
+        return True
+
+    def _generate_clustered_step(
+        self,
+        hl_node: HLNode,
+        ll_node: Constraint,
+        graph: GraphBase,
+    ) -> Optional[Configuration]:
+        """
+        Попытка сделать LL-шага по независимым кластерам.
+        Возвращает новую конфигурацию или None (тогда используем обычный генератор).
+        """
+        forced_moves, _, chain = self._collect_positive_constraints(ll_node)
+        clusters = self._compute_clusters(hl_node.config, graph, forced_moves)
+        if len(clusters) <= 1:
+            return None
+
+        self._hl_metrics['cluster_attempts'] += 1
+        self._hl_metrics['max_clusters'] = max(self._hl_metrics['max_clusters'], len(clusters))
+        for cl in clusters:
+            self._hl_metrics['max_cluster_size'] = max(self._hl_metrics['max_cluster_size'], len(cl))
+
+        cluster_configs: list[Configuration] = []
+        for cluster in clusters:
+            extra_forced: list[tuple[int, int]] = []
+            for aid in range(self.num_agents):
+                if aid in cluster:
+                    continue
+                if aid in forced_moves:
+                    # уже зафиксирован ll-узлом
+                    continue
+                extra_forced.append((aid, hl_node.config[aid]))
+            leaf = self._clone_constraint_chain(chain, extra_forced)
+            conf = self.generator.generate(
+                hl_node=hl_node,
+                constraint=leaf,
+                graph=graph,
+            )
+            if conf is None:
+                # один кластер не смог сделать шаг — откатываемся к глобальному режиму
+                self._hl_metrics['cluster_fallbacks'] += 1
+                return None
+            cluster_configs.append(conf)
+
+        # Собираем итоговую конфигурацию
+        new_pos: list[int] = [hl_node.config[aid] for aid in range(self.num_agents)]
+        for cluster, conf in zip(clusters, cluster_configs):
+            for aid in cluster:
+                new_pos[aid] = conf[aid]
+
+        combined = Configuration(tuple(new_pos))
+        if not self._validate_configuration(hl_node.config, combined, graph, forced_moves):
+            # предохранитель: если вдруг кластеры пересеклись
+            self._hl_metrics['cluster_fallbacks'] += 1
+            return None
+
+        self._hl_metrics['cluster_successes'] += 1
+        return combined
 
     def _constraint_score(
         self,
