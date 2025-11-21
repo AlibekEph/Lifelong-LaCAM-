@@ -240,12 +240,39 @@ def _import_rhcr():
     return Vertex, MapfProblem, GridCell, GoalVerticesDict, convert_gridworld_to_new_gridworld, RhcrSolver, MapfConfig, CbsCAT
 
 
+def _import_cbs():
+    """
+    Lazy import for the CBS solver from extern/gloriousDan-mapf.
+    Shares the same compatibility shims as RHCR.
+    """
+    import typing
+
+    mapf_root = Path(__file__).resolve().parents[1] / "extern" / "gloriousDan-mapf" / "mapf" / "src"
+    if str(mapf_root) not in sys.path:
+        sys.path.insert(0, str(mapf_root))
+    if not hasattr(typing, "TypeAlias"):
+        typing.TypeAlias = typing.Any  # type: ignore[attr-defined]
+
+    try:
+        from mapf.types.mapf_types import Vertex, MapfProblem, GridCell, GoalVerticesDict
+        from mapf.solvers.common_functions import convert_gridworld_to_new_gridworld
+        from mapf.solvers.cbs_solver import CbsSolver
+        from mapf.types.mapf_config import MapfConfig, CbsCAT
+    except Exception as exc:
+        raise ImportError(
+            f"Не удалось импортировать CBS из {mapf_root}. Установите зависимости (intervaltree) и проверьте репозиторий."
+        ) from exc
+
+    return Vertex, MapfProblem, GridCell, GoalVerticesDict, convert_gridworld_to_new_gridworld, CbsSolver, MapfConfig, CbsCAT
+
+
 def run_rhcr(
     graph: GridGraph,
     starts: list[int],
     tasks: list[list[int]],
     stop_mode: str,
     stop_value: int,
+    timeout_s: int = 50,
 ):
     Vertex, MapfProblem, GridCell, GoalVerticesDict, convert_gridworld_to_new_gridworld, RhcrSolver, MapfConfig, CbsCAT = _import_rhcr()
 
@@ -281,7 +308,7 @@ def run_rhcr(
         raise _Timeout()
 
     old_handler = signal.signal(signal.SIGALRM, _handler)
-    signal.alarm(50)  # wall-clock guard requested by user
+    signal.alarm(timeout_s)  # wall-clock guard
     t0 = time.perf_counter()
     try:
         solution, cost = RhcrSolver.solve_instance(problem, config)
@@ -293,7 +320,7 @@ def run_rhcr(
             "total_moves": None,
             "completed_tasks": None,
             "runtime": runtime,
-            "note": "timeout (50s wall clock)",
+            "note": f"timeout ({timeout_s}s wall clock)",
             "path": None,
         }
     finally:
@@ -346,17 +373,121 @@ def run_rhcr(
     }
 
 
+def run_cbs(
+    graph: GridGraph,
+    starts: list[int],
+    tasks: list[list[int]],
+    stop_mode: str,
+    stop_value: int,
+    timeout_s: int = 50,
+):
+    Vertex, MapfProblem, GridCell, GoalVerticesDict, convert_gridworld_to_new_gridworld, CbsSolver, MapfConfig, CbsCAT = _import_cbs()
+
+    grid_world = [[GridCell(bool(graph.grid[r, c])) for c in range(graph.W)] for r in range(graph.H)]
+    new_grid = convert_gridworld_to_new_gridworld(grid_world)
+
+    start_vertex = {aid: Vertex(graph.to_rc(pos)[1], graph.to_rc(pos)[0]) for aid, pos in enumerate(starts)}
+    goal_vertices: GoalVerticesDict = {
+        aid: tuple(Vertex(graph.to_rc(pos)[1], graph.to_rc(pos)[0]) for pos in agent_tasks)
+        for aid, agent_tasks in enumerate(tasks)
+    }
+
+    config = MapfConfig()
+    config.CBS_CONFLICT_AVOIDANCE = CbsCAT.ONLY_HIGHER
+    config.A_STAR_MAX_SEARCH_COUNT = 2000
+    # limit CBS depth slightly via window if provided
+    config.CBS_WINDOW = None
+
+    problem = MapfProblem(
+        agent_ids=list(range(len(starts))),
+        start_vertex=start_vertex,
+        grid=new_grid,
+        init_goal_vertices=goal_vertices,
+    )
+
+    class _Timeout(Exception):
+        pass
+
+    def _handler(_signum, _frame):
+        raise _Timeout()
+
+    old_handler = signal.signal(signal.SIGALRM, _handler)
+    signal.alarm(timeout_s)
+    t0 = time.perf_counter()
+    try:
+        solution, cost = CbsSolver.solve_instance(problem, config)
+        runtime = time.perf_counter() - t0
+    except _Timeout:
+        runtime = time.perf_counter() - t0
+        return {
+            "ticks": None,
+            "total_moves": None,
+            "completed_tasks": None,
+            "runtime": runtime,
+            "note": f"timeout ({timeout_s}s wall clock)",
+            "path": None,
+        }
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
+
+    if not solution:
+        return {
+            "ticks": None,
+            "total_moves": None,
+            "completed_tasks": None,
+            "runtime": runtime,
+            "note": "no solution",
+            "path": None,
+        }
+
+    ticks = max(solution.keys())
+    moves = 0
+    prev = None
+    for t in sorted(solution.keys()):
+        step = solution[t]
+        if prev is not None:
+            for aid, (v, _) in step.items():
+                pv, _ = prev.get(aid, (v, 0))
+                if pv != v:
+                    moves += 1
+        prev = step
+
+    completed = [0 for _ in tasks]
+    progress = [0 for _ in tasks]
+    for t in sorted(solution.keys()):
+        step = solution[t]
+        for aid, goals in enumerate(tasks):
+            if progress[aid] >= len(goals):
+                continue
+            v_goal = goal_vertices[aid][progress[aid]]
+            v_cur, _ = step.get(aid, (None, 0))
+            if v_cur == v_goal:
+                progress[aid] += 1
+                completed[aid] += 1
+
+    return {
+        "ticks": ticks,
+        "total_moves": moves,
+        "completed_tasks": completed,
+        "runtime": runtime,
+        "note": None,
+        "path": None,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Детерминированный тест с большим числом задач (Kiva)")
     parser.add_argument("--num-agents", type=int, default=100, help="Количество агентов")
     parser.add_argument("--tasks-per-agent", type=int, default=5000, help="Число задач на агента")
     parser.add_argument("--seed", type=int, default=0, help="Сид генерации стартов/задач")
-    parser.add_argument("--solver", choices=["lacam", "pypibt", "rhcr"], default="lacam", help="Выбор решателя")
+    parser.add_argument("--solver", choices=["lacam", "pypibt", "rhcr", "cbs"], default="lacam", help="Выбор решателя")
     parser.add_argument("--stop-mode", choices=["tasks", "ticks"], default="tasks", help="Правило остановки")
     parser.add_argument("--ticks-limit", type=int, default=10000, help="Лимит тиков при stop-mode=ticks")
     parser.add_argument("--no-clustering", action="store_true", help="Отключить кластеризацию (для lacam)")
     parser.add_argument("--cluster-window", type=int, default=2, help="Максимальное окно кластеризации/PIBT (w)")
     parser.add_argument("--priority-open", action="store_true", help="Приоритет HL узлов по числу выполненных задач")
+    parser.add_argument("--solver-timeout", type=int, default=50, help="Лимит по времени (сек) для внешних солверов (rhcr/cbs)")
     args = parser.parse_args()
 
     data_path = Path("data/kiva_large_tasks.json")
@@ -401,13 +532,23 @@ def main():
             stop_value=stop_value,
             seed=args.seed,
         )
-    else:
+    elif args.solver == "rhcr":
         result = run_rhcr(
             graph=graph,
             starts=starts,
             tasks=tasks,
             stop_mode=args.stop_mode,
             stop_value=stop_value,
+            timeout_s=args.solver_timeout,
+        )
+    else:
+        result = run_cbs(
+            graph=graph,
+            starts=starts,
+            tasks=tasks,
+            stop_mode=args.stop_mode,
+            stop_value=stop_value,
+            timeout_s=args.solver_timeout,
         )
 
     print(

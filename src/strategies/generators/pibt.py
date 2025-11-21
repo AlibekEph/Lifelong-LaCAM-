@@ -63,6 +63,8 @@ class PIBTGenerator(ConfigGenerator):
         self.stay_bonus: float = 0.25
         # запоминаем последнюю позицию для приоритетного буста за "застревание"
         self._last_positions: TypingOptional[List[int]] = None
+        # отложенные обновления целей, собранные внутри generate()
+        self._pending_goal_events: list[tuple[int, int, int]] = []
 
     def set_current_goals(self, goals: List[int]) -> None:
         """Позволяет LaCAM/Lifelong передавать актуальные цели перед генерацией шага."""
@@ -77,8 +79,12 @@ class PIBTGenerator(ConfigGenerator):
         constraint: Constraint,
         graph: GraphBase,
         task_callback: TypingOptional[Callable[[int, int, int], int]] = None,
+        window: int = 1,
+        allow_goal_callback: bool = False,
+        agent_done: TypingOptional[List[bool]] = None,
     ) -> Optional[Configuration]:
         self._metrics["generate_calls"] += 1
+        self._pending_goal_events = []
         forced_moves, forced_order = self._collect_constraints(constraint)
         self._ensure_priority_vector(hl_node.config.num_agents())
 
@@ -90,6 +96,13 @@ class PIBTGenerator(ConfigGenerator):
         if conf is not None and self._is_valid_configuration(hl_node.config, conf, graph, forced_moves):
             self._metrics["pibt_success"] += 1
             self._update_priority_offsets(conf)
+            self._capture_goal_events(
+                conf,
+                task_callback=task_callback,
+                window=window,
+                allow_goal_callback=allow_goal_callback,
+                agent_done=agent_done,
+            )
             return conf
         else:
             self._metrics["pibt_failures"] += 1
@@ -102,6 +115,13 @@ class PIBTGenerator(ConfigGenerator):
         if conf is not None and self._is_valid_configuration(hl_node.config, conf, graph, forced_moves):
             self._metrics["bruteforce_success"] += 1
             self._update_priority_offsets(conf)
+            self._capture_goal_events(
+                conf,
+                task_callback=task_callback,
+                window=window,
+                allow_goal_callback=allow_goal_callback,
+                agent_done=agent_done,
+            )
             return conf
         else:
             self._metrics["bruteforce_failures"] += 1
@@ -420,6 +440,43 @@ class PIBTGenerator(ConfigGenerator):
         self._time_step += 1
 
         return Configuration(tuple(new_pos))  # type: ignore[arg-type]
+
+    def _capture_goal_events(
+        self,
+        conf: Configuration,
+        task_callback: TypingOptional[Callable[[int, int, int], int]],
+        window: int,
+        allow_goal_callback: bool,
+        agent_done: TypingOptional[List[bool]],
+    ) -> None:
+        """
+        Если работаем в оконном режиме (window>1) и нам разрешили
+        (allow_goal_callback), заранее получаем новые цели через callback.
+        Это нужно, чтобы генератор мог знать новые цели в пределах окна,
+        но сами обновления передаются наружу через _pending_goal_events.
+        """
+        if task_callback is None or not allow_goal_callback or window <= 1:
+            return
+        if self.current_goals is None:
+            return
+        events: list[tuple[int, int, int]] = []
+        for aid, pos in enumerate(conf.pos):
+            if agent_done is not None and aid < len(agent_done) and agent_done[aid]:
+                continue
+            goal = self.current_goals[aid]
+            if pos != goal:
+                continue
+            new_goal = task_callback(aid, pos, goal)
+            events.append((aid, goal, new_goal))
+            if new_goal != goal:
+                self.current_goals[aid] = new_goal
+        self._pending_goal_events = events
+
+    def pop_goal_events(self) -> list[tuple[int, int, int]]:
+        """Забрать и очистить собранные goal events (aid, old_goal, new_goal)."""
+        events = self._pending_goal_events
+        self._pending_goal_events = []
+        return events
 
     # ------------------------------------------------------------
     # Полный перебор одного шага (stay+соседи) для всех агентов

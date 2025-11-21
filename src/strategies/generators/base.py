@@ -29,6 +29,9 @@ class ConfigGenerator(Protocol):
         constraint: Constraint,
         graph: GraphBase,
         task_callback: Optional[Callable[[int, int, int], int]] = None,
+        window: int = 1,
+        allow_goal_callback: bool = False,
+        agent_done: Optional[list[bool]] = None,
     ) -> Optional[Configuration]:
         """
         Попытаться построить новую Configuration, учитывая:
@@ -39,6 +42,9 @@ class ConfigGenerator(Protocol):
             - коллизии между агентами
             - при необходимости вызвать task_callback, если агентов нужно
               отправить на новую цель (используется при оконном планировании)
+              Вызов происходит только если allow_goal_callback=True, обычно
+              когда генератор работает в окне >1 и нужно сразу знать
+              следующую цель для эвристик.
 
         Возвращает:
             Configuration — если удалось построить допустимую конфигурацию

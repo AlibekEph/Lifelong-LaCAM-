@@ -61,7 +61,7 @@ class LifelongLaCAMIntegrated:
         open_policy: OpenPolicy
         task_callback: Callable - функция назначения новых целей
         reinsert: bool
-        max_tasks_per_agent: int - максимум задач на агента (условие остановки)
+        max_tasks_per_agent: int | None - максимум задач на агента (условие остановки), None = без лимита
     """
     
     graph: GraphBase
@@ -72,7 +72,7 @@ class LifelongLaCAMIntegrated:
     open_policy: OpenPolicy
     task_callback: TaskCallback
     reinsert: bool = False
-    max_tasks_per_agent: int = 10  # условие остановки
+    max_tasks_per_agent: Optional[int] = None  # None = без лимита
     occupancy_penalty: float = 5.0
     backtrack_penalty: float = 1.0
     stay_bonus: float = 0.25
@@ -145,6 +145,8 @@ class LifelongLaCAMIntegrated:
         # Статистика
         self.goal_updates_count = 0
         self.total_iterations = 0
+        # буфер событий о смене целей, собранных генератором
+        self._generator_goal_events: list[tuple[int, int, int]] = []
     
     def run(self, max_iterations: Optional[int] = None, verbose: bool = False) -> Optional[list[Configuration]]:
         """
@@ -169,6 +171,7 @@ class LifelongLaCAMIntegrated:
                 iterations += 1
                 self.total_iterations = iterations
                 self._hl_metrics['iterations'] = iterations
+                self._generator_goal_events = []
                 
                 hl_node = self.open_policy.peek()
                 
@@ -250,7 +253,12 @@ class LifelongLaCAMIntegrated:
                         hl_node=hl_node,
                         constraint=ll_node,
                         graph=self.graph,
+                        task_callback=self.task_callback,
+                        window=self.cluster_window_w,
+                        allow_goal_callback=True,
+                        agent_done=self._agent_done,
                     )
+                    self._collect_generator_goal_events()
                 
                 if new_config is None:
                     self._hl_metrics['generator_failures'] += 1
@@ -260,7 +268,7 @@ class LifelongLaCAMIntegrated:
                 
                 # ⭐ КЛЮЧЕВАЯ ЛОГИКА LIFELONG ⭐
                 # Проверяем, кто достиг цели в новой конфигурации
-                goals_updated = self._check_and_update_goals(new_config, verbose)
+                goals_updated = self._apply_generator_goal_events(new_config, verbose)
                 
                 # Если обновили цели, обновляем goal_config
                 if goals_updated:
@@ -682,7 +690,11 @@ class LifelongLaCAMIntegrated:
                 constraint=constraint,
                 graph=graph,
                 task_callback=self.task_callback,
+                window=1,
+                allow_goal_callback=False,
+                agent_done=self._agent_done,
             )
+            self._collect_generator_goal_events()
             if conf is None:
                 continue
             if not self._validate_configuration(hl_node.config, conf, graph, forced_moves):
@@ -719,6 +731,74 @@ class LifelongLaCAMIntegrated:
                 penalty += self.backtrack_penalty
 
         return dist + penalty
+
+    # ------------------------------------------------------------
+    # Применение goal callback из генератора
+    # ------------------------------------------------------------
+    def _collect_generator_goal_events(self) -> None:
+        """Забрать отложенные goal events из генератора (если он их умеет отдавать)."""
+        if not hasattr(self.generator, "pop_goal_events"):
+            return
+        try:
+            events = self.generator.pop_goal_events()  # type: ignore[attr-defined]
+        except Exception:
+            return
+        if events:
+            self._generator_goal_events.extend(events)
+
+    def _apply_generator_goal_events(self, config: Configuration, verbose: bool) -> bool:
+        """
+        Если генератор уже получил новые цели внутри окна, применяем их,
+        иначе используем стандартную _check_and_update_goals.
+        """
+        if not self._generator_goal_events:
+            return self._check_and_update_goals(config, verbose)
+
+        goals_updated = False
+        merged: dict[int, tuple[int, int]] = {}
+        for aid, old_goal, new_goal in self._generator_goal_events:
+            merged[aid] = (old_goal, new_goal)
+
+        for aid in range(self.num_agents):
+            if self._agent_done[aid]:
+                continue
+            if aid in merged:
+                continue
+            if config[aid] != self.goals[aid]:
+                self._goal_completion_ack[aid] = False
+
+        for aid, (old_goal, new_goal) in merged.items():
+            if self._agent_done[aid]:
+                continue
+            if config[aid] != self.goals[aid]:
+                self._goal_completion_ack[aid] = False
+                continue
+
+            if not self._goal_completion_ack[aid]:
+                self.completed_tasks_count[aid] += 1
+                self.completed_tasks_history[aid].append(old_goal)
+                self._goal_completion_ack[aid] = True
+
+                if verbose:
+                    print(f"    Агент {aid}: завершил цель {old_goal} "
+                          f"(всего задач: {self.completed_tasks_count[aid]})")
+
+            if self.max_tasks_per_agent is not None:
+                if self.completed_tasks_count[aid] >= self.max_tasks_per_agent:
+                    self._agent_done[aid] = True
+                    continue
+
+            if new_goal != old_goal:
+                self.goals[aid] = new_goal
+                self.goal_updates_count += 1
+                self._goal_completion_ack[aid] = False
+                goals_updated = True
+
+                if verbose:
+                    print(f"    Агент {aid}: новая цель {new_goal}")
+
+        self._generator_goal_events = []
+        return goals_updated
     
     def _check_and_update_goals(self, config: Configuration, verbose: bool) -> bool:
         """
@@ -755,10 +835,11 @@ class LifelongLaCAMIntegrated:
                     print(f"    Агент {agent_id}: завершил цель {old_goal} "
                           f"(всего задач: {self.completed_tasks_count[agent_id]})")
 
-            if self.completed_tasks_count[agent_id] >= self.max_tasks_per_agent:
-                self._agent_done[agent_id] = True
-                # достигнут лимит задач — больше целей не выдаём
-                continue
+            if self.max_tasks_per_agent is not None:
+                if self.completed_tasks_count[agent_id] >= self.max_tasks_per_agent:
+                    self._agent_done[agent_id] = True
+                    # достигнут лимит задач — больше целей не выдаём
+                    continue
 
             if new_goal != old_goal:
                 self.goals[agent_id] = new_goal
@@ -776,6 +857,8 @@ class LifelongLaCAMIntegrated:
         Проверяет условие остановки:
         все ли агенты выполнили достаточно задач?
         """
+        if self.max_tasks_per_agent is None:
+            return False
         return all(count >= self.max_tasks_per_agent 
                    for count in self.completed_tasks_count)
     
