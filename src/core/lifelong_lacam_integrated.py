@@ -26,7 +26,7 @@ class ClusterLLState:
     """Состояние LL-поиска для отдельного кластера."""
     cluster: list[int]
     order: list[int]
-    constraint_tree: deque[tuple[Constraint, int]]  # (constraint, depth по cluster order)
+    constraint_tree: deque[tuple[Constraint, int]]
     found_config: Optional[Configuration] = None
     failed: bool = False
 from .graph.base import GraphBase
@@ -36,8 +36,6 @@ from strategies.ordering.base import AgentOrdering
 from strategies.open_policy.base import OpenPolicy
 
 
-# Callback для назначения новой цели
-# (agent_id, current_pos, old_goal) -> new_goal
 TaskCallback = Callable[[int, int, int], int]
 
 
@@ -72,37 +70,32 @@ class LifelongLaCAMIntegrated:
     open_policy: OpenPolicy
     task_callback: TaskCallback
     reinsert: bool = False
-    max_tasks_per_agent: Optional[int] = None  # None = без лимита
+    max_tasks_per_agent: Optional[int] = None
     occupancy_penalty: float = 5.0
     backtrack_penalty: float = 1.0
     stay_bonus: float = 0.25
     enable_clustering: bool = True
-    cluster_radius: int = 1  # устарело, сохраняем для обратной совместимости
-    cluster_window_w: int = 2  # максимальный размер окна для кластеризации/PIBT
-    cluster_ll_limit: int = 100  # лимит на число узлов LL-поиска внутри кластера
+    cluster_radius: int = 1
+    cluster_window_w: int = 2
+    cluster_ll_limit: int = 100
     
     def __post_init__(self):
         assert len(self.starts) == len(self.initial_goals)
         
-        # Текущие цели (будут динамически обновляться)
         self.goals = list(self.initial_goals)
         self.start_config = Configuration(tuple(self.starts))
-        self.goal_config = Configuration(tuple(self.goals))  # будет обновляться!
+        self.goal_config = Configuration(tuple(self.goals))
         self.num_agents = len(self.starts)
         
-        # Статистика выполненных задач
         self.completed_tasks_count = [0] * self.num_agents
         self.completed_tasks_history: List[List[int]] = [[] for _ in range(self.num_agents)]
-        # Флаг: агент уже получил награду за достижение текущей цели
         self._goal_completion_ack = [False] * self.num_agents
-        # Агент достиг лимита задач и больше не участвует в выдаче целей
         self._agent_done = [False] * self.num_agents
-        # Метрики HL-поиска
         self._hl_metrics = {
-            'hl_nodes_created': 1,  # root HL-node
+            'hl_nodes_created': 1,
             'hl_revisited_nodes': 0,
             'll_expansions': 0,
-            'll_nodes_created': 1,  # root constraint
+            'll_nodes_created': 1,
             'max_constraint_queue': 1,
             'generator_failures': 0,
             'generator_successes': 0,
@@ -117,10 +110,8 @@ class LifelongLaCAMIntegrated:
             'max_cluster_size': self.num_agents,
         }
         
-        # Explored таблица
         self._explored: Dict[tuple[Configuration, tuple[int, ...]], HLNode] = {}
         
-        # Инициализация root node
         root_constraint = Constraint(parent=None, who=None, where=None, depth=0)
         constraint_tree = deque([root_constraint])
         
@@ -142,10 +133,8 @@ class LifelongLaCAMIntegrated:
         self._explored[self._state_key(self.start_config, self.goals)] = root_node
         self.open_policy.push(root_node)
         
-        # Статистика
         self.goal_updates_count = 0
         self.total_iterations = 0
-        # буфер событий о смене целей, собранных генератором
         self._generator_goal_events: list[tuple[int, int, int]] = []
     
     def run(self, max_iterations: Optional[int] = None, verbose: bool = False) -> Optional[list[Configuration]]:
@@ -175,11 +164,9 @@ class LifelongLaCAMIntegrated:
                 
                 hl_node = self.open_policy.peek()
                 
-                # Проверка: все ли агенты выполнили достаточно задач?
                 if self._check_stopping_condition():
                     return hl_node.reconstruct_path()
                 
-                # Стандартная логика LaCAM
                 if not hl_node.constraint_tree:
                     self.open_policy.pop()
                     continue
@@ -187,7 +174,6 @@ class LifelongLaCAMIntegrated:
                 ll_node = hl_node.constraint_tree.popleft()
                 self._hl_metrics['ll_expansions'] += 1
 
-                # Перед генерацией шага прокидываем текущие цели в генератор, если поддерживается
                 if hasattr(self.generator, "set_current_goals"):
                     try:
                         self.generator.set_current_goals(self.goals)
@@ -195,8 +181,6 @@ class LifelongLaCAMIntegrated:
                         pass
 
                 pos_to_agent = {pos: idx for idx, pos in enumerate(hl_node.config.pos)}
-
-                # Расширяем constraint tree
                 if ll_node.depth < self.num_agents:
                     agent_idx = hl_node.order[ll_node.depth]
                     current_pos = hl_node.config[agent_idx]
@@ -229,7 +213,6 @@ class LifelongLaCAMIntegrated:
                             len(hl_node.constraint_tree),
                         )
 
-                # Генерируем новую конфигурацию (сначала пробуем кластеризацию)
                 new_config = None
                 cluster_plan: Optional[list[ClusterPlanSnapshot]] = None
                 cluster_window_used: Optional[int] = None
@@ -241,7 +224,6 @@ class LifelongLaCAMIntegrated:
                     )
                     clustered_config, cluster_plan, cluster_window_used, cluster_failed = cluster_result
                     if cluster_failed:
-                        # полный фолбек: просто игнорируем кластеризацию и пробуем общий генератор
                         clustered_config = None
                         cluster_plan = None
                         cluster_window_used = None
@@ -266,11 +248,8 @@ class LifelongLaCAMIntegrated:
                 
                 self._hl_metrics['generator_successes'] += 1
                 
-                # ⭐ КЛЮЧЕВАЯ ЛОГИКА LIFELONG ⭐
-                # Проверяем, кто достиг цели в новой конфигурации
                 goals_updated = self._apply_generator_goal_events(new_config, verbose)
                 
-                # Если обновили цели, обновляем goal_config
                 if goals_updated:
                     self.goal_config = Configuration(tuple(self.goals))
                     
@@ -278,16 +257,13 @@ class LifelongLaCAMIntegrated:
                         print(f"  Итерация {iterations}: Обновлены цели. "
                               f"Текущие цели: {self.goals}")
                 
-                # Проверка: может быть новая конфигурация уже удовлетворяет всем условиям?
                 if self._check_stopping_condition():
                     if verbose:
                         print(f"\n✓ Достигнуто условие остановки!")
-                    # Создаём путь и возвращаем
                     path = hl_node.reconstruct_path()
                     path.append(new_config)
                     return path
                 
-                # Стандартная обработка: проверка explored
                 existing_node = self._explored.get(self._state_key(new_config, self.goals))
                 if existing_node is not None:
                     hl_node.neighbors.add(existing_node)
@@ -296,8 +272,6 @@ class LifelongLaCAMIntegrated:
                     if self.reinsert:
                         self.open_policy.push(existing_node)
                     continue
-                
-                # Создаём новый HL-узел
                 child_constraint_root = Constraint(
                     parent=None,
                     who=None,
@@ -311,7 +285,6 @@ class LifelongLaCAMIntegrated:
                     len(child_tree),
                 )
                 
-                # ВАЖНО: используем текущие (возможно обновлённые) цели
                 new_order = self.ordering.reorder(
                     config=new_config,
                     prev_order=hl_node.order,
@@ -339,7 +312,6 @@ class LifelongLaCAMIntegrated:
                 self._explored[self._state_key(new_config, self.goals)] = child_node
                 self.open_policy.push(child_node)
             
-            # Не нашли решение
             if verbose:
                 print(f"\n⚠️  Open пуст после {iterations} итераций")
                 print(f"   Задач выполнено: {self.completed_tasks_count}")
@@ -365,9 +337,6 @@ class LifelongLaCAMIntegrated:
         finished = [aid for aid in order if self._agent_done[aid]]
         return active + finished
 
-    # ------------------------------------------------------------
-    # Кластеры и вспомогательные функции LL
-    # ------------------------------------------------------------
     def _collect_positive_constraints(self, constraint: Constraint) -> tuple[dict[int, int], list[int], list[Constraint]]:
         """
         Собрать все positive constraints (who -> where) из цепочки LL-узлов от корня до constraint.
@@ -393,13 +362,10 @@ class LifelongLaCAMIntegrated:
         """
         parent: Optional[Constraint] = None
         depth = 0
-        # корень
         parent = Constraint(parent=None, who=None, where=None, depth=depth)
-        # основная цепочка (пропускаем старый корень)
         for node in base_chain[1:]:
             depth += 1
             parent = Constraint(parent=parent, who=node.who, where=node.where, depth=depth)
-        # дополнительные ограничения
         for who, where in extra_forced:
             depth += 1
             parent = Constraint(parent=parent, who=who, where=where, depth=depth)
@@ -463,10 +429,8 @@ class LifelongLaCAMIntegrated:
         forced_moves: dict[int, int],
     ) -> bool:
         """Глобальная проверка корректности шага (вершинные/ребровые коллизии, допустимость ходов, respect forced)."""
-        # vertex collisions
         if len(set(new_conf.pos)) != len(new_conf.pos):
             return False
-        # moves and forced
         for aid, (u, v) in enumerate(zip(old_conf.pos, new_conf.pos)):
             if graph.is_blocked(v):
                 return False
@@ -475,7 +439,6 @@ class LifelongLaCAMIntegrated:
             forced = forced_moves.get(aid)
             if forced is not None and forced != v:
                 return False
-        # edge swaps
         n = len(old_conf.pos)
         for i in range(n):
             for j in range(i + 1, n):
@@ -498,14 +461,12 @@ class LifelongLaCAMIntegrated:
         """
         forced_moves, _, chain = self._collect_positive_constraints(ll_node)
 
-        # Перебор окна, чтобы получить разбиение на кластеры
         window_used: Optional[int] = None
         clusters: list[list[int]] = []
         for window in range(self.cluster_window_w, 0, -1):
             clusters = self._compute_clusters(hl_node.config, graph, forced_moves, window)
             if len(clusters) <= 1:
                 continue
-            # защитное ограничение: если кластер слишком велик, пропускаем кластеризацию для этого окна
             if any(len(cl) > 4 for cl in clusters):
                 continue
             window_used = window
@@ -553,7 +514,6 @@ class LifelongLaCAMIntegrated:
         )
         hl_node.cluster_ll_states = states
 
-        # Полностью растим LL-дерево каждого кластера
         for state in states:
             self._process_cluster_state(
                 hl_node=hl_node,
@@ -562,10 +522,8 @@ class LifelongLaCAMIntegrated:
                 forced_moves=forced_moves,
             )
             if state.failed or state.found_config is None:
-                # Фолбек целиком
                 self._hl_metrics['cluster_fallbacks'] += 1
                 return None, None, None, True
-            # сохраняем найденные позиции кластера
             for aid in state.cluster:
                 combined_pos[aid] = state.found_config[aid]
             key = (tuple(state.cluster), window_used, forced_sig)
@@ -580,9 +538,6 @@ class LifelongLaCAMIntegrated:
         hl_node.cluster_cache = cache
         return combined, None, window_used, False
 
-    # ------------------------------------------------------------
-    # Кластерный LL-поиск
-    # ------------------------------------------------------------
     def _build_cluster_states(
         self,
         hl_node: HLNode,
@@ -604,7 +559,7 @@ class LifelongLaCAMIntegrated:
             state = ClusterLLState(
                 cluster=list(cluster),
                 order=order,
-                constraint_tree=deque([(root, 0)]),  # (constraint, depth w.r.t cluster order)
+                constraint_tree=deque([(root, 0)]),
             )
             states.append(state)
         return states
@@ -672,7 +627,6 @@ class LifelongLaCAMIntegrated:
                 return
             constraint, depth = cluster_state.constraint_tree.popleft()
             self._hl_metrics['ll_expansions'] += 1
-            # Расширяем детей, если не все агенты кластера назначены
             if depth < len(cluster_state.order):
                 self._expand_cluster_constraint(
                     hl_node=hl_node,
@@ -683,8 +637,6 @@ class LifelongLaCAMIntegrated:
                     forced_moves=forced_moves,
                 )
                 continue
-
-            # Все агенты кластера зафиксированы — пробуем генератор
             conf = self.generator.generate(
                 hl_node=hl_node,
                 constraint=constraint,
@@ -732,9 +684,6 @@ class LifelongLaCAMIntegrated:
 
         return dist + penalty
 
-    # ------------------------------------------------------------
-    # Применение goal callback из генератора
-    # ------------------------------------------------------------
     def _collect_generator_goal_events(self) -> None:
         """Забрать отложенные goal events из генератора (если он их умеет отдавать)."""
         if not hasattr(self.generator, "pop_goal_events"):
@@ -818,14 +767,12 @@ class LifelongLaCAMIntegrated:
                 continue
 
             if current_pos != current_goal:
-                # как только агент покидает цель, можно снова засчитывать достижение
                 self._goal_completion_ack[agent_id] = False
                 continue
 
             old_goal = current_goal
             new_goal = self.task_callback(agent_id, current_pos, old_goal)
 
-            # учитываем достижение цели один раз, пока агент не покинет её
             if not self._goal_completion_ack[agent_id]:
                 self.completed_tasks_count[agent_id] += 1
                 self.completed_tasks_history[agent_id].append(old_goal)
@@ -838,7 +785,6 @@ class LifelongLaCAMIntegrated:
             if self.max_tasks_per_agent is not None:
                 if self.completed_tasks_count[agent_id] >= self.max_tasks_per_agent:
                     self._agent_done[agent_id] = True
-                    # достигнут лимит задач — больше целей не выдаём
                     continue
 
             if new_goal != old_goal:

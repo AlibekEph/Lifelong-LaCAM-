@@ -56,6 +56,83 @@ def export_visualizer_files(name: str, graph: GridGraph, config_list: list[Confi
     return map_path, sol_path
 
 
+def export_visualizer_episodes(
+    name: str,
+    graph: GridGraph,
+    config_list: list[Configuration],
+    episode_len: int,
+    starts: list[int] | None = None,
+    tasks: list[list[int]] | None = None,
+) -> tuple[str | None, list[str]]:
+    """
+    Экспорт нескольких эпизодов для визуализации.
+    Если episode_len > 0 — режем по фиксированной длине.
+    Иначе, при наличии starts/tasks — режем по событиям выполнения цели.
+    """
+    if not _VIS_EXPORT_FLAG:
+        return None, []
+    os.makedirs(_VIS_EXPORT_DIR, exist_ok=True)
+
+    def _segments_by_completion() -> list[tuple[int, int]]:
+        if starts is None or tasks is None or len(config_list) < 2:
+            return [(0, len(config_list) - 1)]
+        task_queues = [deque(agent_tasks) for agent_tasks in tasks]
+        current = [q[0] if q else None for q in task_queues]
+        segs: list[tuple[int, int]] = []
+        seg_start = 0
+        for t in range(1, len(config_list)):
+            completed = False
+            positions = config_list[t].pos
+            for aid, pos in enumerate(positions):
+                goal = current[aid]
+                if goal is not None and pos == goal:
+                    task_queues[aid].popleft()
+                    current[aid] = task_queues[aid][0] if task_queues[aid] else None
+                    completed = True
+            if completed:
+                segs.append((seg_start, t))
+                seg_start = t
+        if seg_start < len(config_list) - 1:
+            segs.append((seg_start, len(config_list) - 1))
+        return segs
+
+    if episode_len > 0:
+        segments = [(s, min(s + episode_len - 1, len(config_list) - 1)) for s in range(0, len(config_list), episode_len)]
+    else:
+        segments = _segments_by_completion()
+
+    map_path = os.path.join(_VIS_EXPORT_DIR, f"{name}.map")
+    charset = {True: "@", False: "."}
+    rows = ["".join(charset[bool(cell)] for cell in graph.grid[r, :]) for r in range(graph.H)]
+    with open(map_path, "w", encoding="utf-8") as f:
+        f.writelines(
+            [
+                "type octile\n",
+                f"height {graph.H}\n",
+                f"width {graph.W}\n",
+                "map\n",
+            ]
+        )
+        for row in rows:
+            f.write(row + "\n")
+
+    sol_paths: list[str] = []
+    for idx, (s, e) in enumerate(segments, start=1):
+        if e <= s:
+            continue
+        chunk = config_list[s : e + 1]
+        sol_path = os.path.join(_VIS_EXPORT_DIR, f"{name}_ep{idx}.txt")
+        with open(sol_path, "w", encoding="utf-8") as f:
+            for t_local, conf in enumerate(chunk):
+                coords = []
+                for pos in conf.pos:
+                    r, c = graph.to_rc(pos)
+                    coords.append(f"({c},{r})")
+                f.write(f"{t_local}:" + ",".join(coords) + ",\n")
+        sol_paths.append(sol_path)
+    return map_path, sol_paths
+
+
 def sample_unique_free(graph: GridGraph, num: int, seed: int) -> list[int]:
     import random
     rng = random.Random(seed)
@@ -210,7 +287,6 @@ def run_pypibt(
     }
 
 
-# ---------------- RHCR baseline ----------------
 
 
 def _import_rhcr():
@@ -276,7 +352,6 @@ def run_rhcr(
 ):
     Vertex, MapfProblem, GridCell, GoalVerticesDict, convert_gridworld_to_new_gridworld, RhcrSolver, MapfConfig, CbsCAT = _import_rhcr()
 
-    # convert grid to mapf format (x=col, y=row; True=blocked)
     grid_world = [[GridCell(bool(graph.grid[r, c])) for c in range(graph.W)] for r in range(graph.H)]
     new_grid = convert_gridworld_to_new_gridworld(grid_world)
 
@@ -287,7 +362,6 @@ def run_rhcr(
     }
 
     config = MapfConfig()
-    # slightly tighter defaults to reduce runtime; can be tweaked later
     config.RHCR_TIME_HORIZON_w = 5
     config.RHCR_REPLANNING_PERIOD_h = 5
     config.CBS_WINDOW = 5
@@ -338,7 +412,6 @@ def run_rhcr(
         }
 
     ticks = max(solution.keys())
-    # compute total moves by comparing consecutive time steps
     moves = 0
     prev = None
     for t in sorted(solution.keys()):
@@ -350,7 +423,6 @@ def run_rhcr(
                     moves += 1
         prev = step
 
-    # count completed goals per agent
     completed = [0 for _ in tasks]
     progress = [0 for _ in tasks]
     for t in sorted(solution.keys()):
@@ -395,7 +467,6 @@ def run_cbs(
     config = MapfConfig()
     config.CBS_CONFLICT_AVOIDANCE = CbsCAT.ONLY_HIGHER
     config.A_STAR_MAX_SEARCH_COUNT = 2000
-    # limit CBS depth slightly via window if provided
     config.CBS_WINDOW = None
 
     problem = MapfProblem(
@@ -488,6 +559,7 @@ def main():
     parser.add_argument("--cluster-window", type=int, default=2, help="Максимальное окно кластеризации/PIBT (w)")
     parser.add_argument("--priority-open", action="store_true", help="Приоритет HL узлов по числу выполненных задач")
     parser.add_argument("--solver-timeout", type=int, default=50, help="Лимит по времени (сек) для внешних солверов (rhcr/cbs)")
+    parser.add_argument("--episode-length", type=int, default=0, help="Длина эпизода для отдельной визуализации (0 — без разбивки)")
     args = parser.parse_args()
 
     data_path = Path("data/kiva_large_tasks.json")
@@ -496,7 +568,6 @@ def main():
     grid = layout_to_grid(payload["layout"])
     graph = GridGraph(grid)
 
-    # фиксируем RNG для воспроизводимости (PIBTGenerator использует random.shuffle)
     random.seed(args.seed)
     np.random.seed(args.seed)
 
@@ -561,13 +632,21 @@ def main():
 
     if _VIS_EXPORT_FLAG and result.get("path"):
         name = f"kiva_bulk_{args.solver}"
-        map_path, sol_path = export_visualizer_files(name, graph, result["path"])
+        map_path, sol_paths = export_visualizer_episodes(
+            name=name,
+            graph=graph,
+            config_list=result["path"],
+            episode_len=args.episode_length,
+            starts=starts,
+            tasks=tasks,
+        )
         vis_bin = shutil.which("mapf-visualizer-lifelong")
-        if vis_bin and map_path and sol_path:
-            try:
-                subprocess.run([vis_bin, map_path, sol_path], check=True)
-            except Exception as exc:
-                print(f"⚠️  Визуализатор не запустился: {exc}")
+        if vis_bin and map_path and sol_paths:
+            for sol_path in sol_paths:
+                try:
+                    subprocess.run([vis_bin, map_path, sol_path], check=True)
+                except Exception as exc:
+                    print(f"⚠️  Визуализатор не запустился для {sol_path}: {exc}")
 
 
 if __name__ == "__main__":

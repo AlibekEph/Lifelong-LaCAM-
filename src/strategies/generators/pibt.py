@@ -36,13 +36,9 @@ class PIBTGenerator(ConfigGenerator):
     """
 
     def __init__(self):
-        # текущие цели агентов (может подменяться Lifelong LaCAM)
         self.current_goals: TypingOptional[List[int]] = None
-        # глобальный счётчик тактов для круговой ротации приоритетов (PIBT)
         self._time_step: int = 0
-        # накапливаем динамические приоритеты (кто дольше ждёт цели)
         self._priority_offsets: TypingOptional[List[float]] = None
-        # собираем статистику работы генератора
         self._metrics = {
             "generate_calls": 0,
             "pibt_calls": 0,
@@ -58,21 +54,15 @@ class PIBTGenerator(ConfigGenerator):
         self._stack_depth_count: int = 0
         self._stack_depth_sum: int = 0
         self._stack_depth_max: int = 0
-        # эвристические параметры
         self.occupancy_penalty: float = 5.0
         self.stay_bonus: float = 0.25
-        # запоминаем последнюю позицию для приоритетного буста за "застревание"
         self._last_positions: TypingOptional[List[int]] = None
-        # отложенные обновления целей, собранные внутри generate()
         self._pending_goal_events: list[tuple[int, int, int]] = []
 
     def set_current_goals(self, goals: List[int]) -> None:
         """Позволяет LaCAM/Lifelong передавать актуальные цели перед генерацией шага."""
         self.current_goals = goals
 
-    # ------------------------------------------------------------
-    # PUBLIC API
-    # ------------------------------------------------------------
     def generate(
         self,
         hl_node: HLNode,
@@ -88,7 +78,6 @@ class PIBTGenerator(ConfigGenerator):
         forced_moves, forced_order = self._collect_constraints(constraint)
         self._ensure_priority_vector(hl_node.config.num_agents())
 
-        # 1) Быстрая попытка PIBT
         self._metrics["pibt_calls"] += 1
         start = time.perf_counter()
         conf = self._generate_pibt(hl_node, forced_moves, forced_order, graph)
@@ -107,7 +96,6 @@ class PIBTGenerator(ConfigGenerator):
         else:
             self._metrics["pibt_failures"] += 1
 
-        # 2) Полный перебор даёт гарантированную полноту LL-шага
         self._metrics["bruteforce_calls"] += 1
         start = time.perf_counter()
         conf = self._generate_bruteforce(hl_node, forced_moves, forced_order, graph)
@@ -131,7 +119,6 @@ class PIBTGenerator(ConfigGenerator):
     def get_metrics(self) -> Dict[str, int]:
         """Вернуть собранные метрики генератора."""
         metrics = dict(self._metrics)
-        # средние времена PIBT/Bruteforce
         metrics["pibt_avg_time"] = (
             self._metrics["pibt_time"] / self._metrics["pibt_calls"]
             if self._metrics["pibt_calls"] > 0 else 0.0
@@ -197,9 +184,6 @@ class PIBTGenerator(ConfigGenerator):
                 self._priority_offsets[aid] += 1.0 + stuck_bonus
             self._last_positions[aid] = pos
 
-    # ------------------------------------------------------------
-    # INTERNAL: PIBT recursion
-    # ------------------------------------------------------------
     def _pibt_dfs(
         self,
         agent: int,
@@ -221,12 +205,9 @@ class PIBTGenerator(ConfigGenerator):
         - Если функция возвращает False:
             new_pos и reserved остаются в том же состоянии, что и на входе
         """
-
-        # Уже спланирован (другим рекурсивным вызовом)
         if new_pos[agent] is not None:
             return True
 
-        # Защита от циклов priority inheritance
         if agent in in_stack:
             return False
         in_stack.add(agent)
@@ -234,20 +215,15 @@ class PIBTGenerator(ConfigGenerator):
 
         cur_v = old_conf[agent]
 
-        # 1) Формируем список кандидатов.
-        #    Если есть constraint -> ровно один кандидат.
         if agent in forced_moves:
             candidates = [forced_moves[agent]]
         else:
             neigh = list(graph.neighbors(cur_v))
             random.shuffle(neigh)
             has_stay = False
-            # включаем stay
             if not graph.is_blocked(cur_v) and cur_v not in neigh:
                 has_stay = True
-                #pass
 
-            # сортировка по эвристике: ближе к цели → раньше
             if self.current_goals is not None:
                 goal = self.current_goals[agent]
 
@@ -266,52 +242,36 @@ class PIBTGenerator(ConfigGenerator):
                             penalty += self.occupancy_penalty
                     return d + penalty
 
-                # сортируем движущиеся кандидаты, stay добавим в конец
                 move_candidates = sorted([v for v in neigh if v != cur_v], key=_heur)
                 candidates = move_candidates + ([cur_v] if has_stay else [])
             else:
                 move_candidates = [v for v in neigh if v != cur_v]
                 candidates = move_candidates + ([cur_v] if has_stay else [])
 
-        # 2) Пытаемся каждый кандидат
         for v in candidates:
-            # сразу отбрасываем запрещённые вершины
             if graph.is_blocked(v):
                 continue
 
-            # Проверяем, не зарезервирована ли вершина кем-то другим
-            # (если резервировал другой агент, не текущий occupant)
             if v in reserved:
-                # возможно это "occupant", который уже перепланирован;
-                # но тогда pos2agent[v] либо другой, либо уже не на v.
                 occ = pos2agent.get(v)
                 if occ is None or new_pos[occ] == v:
-                    # реально занято на t+1
                     continue
 
-            # Определяем агента, который стоит в v на старой конфигурации
             occupant = pos2agent.get(v, None)
             if occupant is not None:
-                # если occupant уже уходит из v (new_pos другое) → v свободно
                 if new_pos[occupant] is not None and new_pos[occupant] != v:
                     occupant = None
 
-            # 2.1. Если вершина свободна на t+1 → просто занимаем её
             if occupant is None:
                 if self._check_edge_conflicts_local(agent, cur_v, v, old_conf.pos, new_pos):
-                    # edge conflict (swap) → пропускаем этот v
                     continue
 
-                # Регистрируем ход и выходим с успехом
                 new_pos[agent] = v
                 reserved.add(v)
                 in_stack.remove(agent)
                 return True
 
-            # 2.2. Вершина занята другим агентом в старой конфигурации.
-            #      Пробуем priority inheritance (если наш приоритет выше).
             if occupant == agent:
-                # stay на месте: разрешаем его, если нет edge-конфликта
                 if self._check_edge_conflicts_local(agent, cur_v, v, old_conf.pos, new_pos):
                     in_stack.remove(agent)
                     return False
@@ -321,15 +281,12 @@ class PIBTGenerator(ConfigGenerator):
                 in_stack.remove(agent)
                 return True
 
-            # Если наш приоритет НЕ выше → не можем "пинать" occupant.
             if pri[agent] >= pri[occupant]:
                 continue
 
-            # Если occupant уже в рекурсивном стеке → цикл, пропускаем
             if occupant in in_stack:
                 continue
 
-            # Пытаемся перепланировать occupant
             if not self._pibt_dfs(
                 agent=occupant,
                 old_conf=old_conf,
@@ -341,34 +298,22 @@ class PIBTGenerator(ConfigGenerator):
                 in_stack=in_stack,
                 graph=graph,
             ):
-                # Не удалось сдвинуть occupant → пробуем следующий кандидат v
                 continue
 
-            # После успешного перепланирования occupant:
-            # - new_pos[occupant] установлено
-            # - reserved содержит его новую вершину
-            # Если он всё равно остался в v → мы всё ещё не можем занять v.
             if new_pos[occupant] == v:
                 continue
 
-            # Проверяем edge-конфликт (swap) с уже запланированными агентами
             if self._check_edge_conflicts_local(agent, cur_v, v, old_conf.pos, new_pos):
                 continue
 
-            # Теперь v свободна → занимаем её
             new_pos[agent] = v
             reserved.add(v)
             in_stack.remove(agent)
             return True
 
-        # Если ни один кандидат не сработал → откат:
-        # new_pos[agent] так и не был установлен, reserved не меняли
         in_stack.remove(agent)
         return False
 
-    # ------------------------------------------------------------
-    # PIBT core (выделено для возможности fallback)
-    # ------------------------------------------------------------
     def _generate_pibt(
         self,
         hl_node: HLNode,
@@ -436,7 +381,6 @@ class PIBTGenerator(ConfigGenerator):
         if self._has_edge_conflict(old_conf.pos, new_pos):
             return None
 
-        # завершили попытку LL-шага → увеличиваем глобальный таймер
         self._time_step += 1
 
         return Configuration(tuple(new_pos))  # type: ignore[arg-type]
@@ -478,9 +422,6 @@ class PIBTGenerator(ConfigGenerator):
         self._pending_goal_events = []
         return events
 
-    # ------------------------------------------------------------
-    # Полный перебор одного шага (stay+соседи) для всех агентов
-    # ------------------------------------------------------------
     def _generate_bruteforce(
         self,
         hl_node: HLNode,
@@ -491,7 +432,6 @@ class PIBTGenerator(ConfigGenerator):
         old_conf: Configuration = hl_node.config
         num_agents = old_conf.num_agents()
 
-        # список кандидатов на ход для каждого агента
         cand_lists: List[List[int]] = [[] for _ in range(num_agents)]
         for aid in range(num_agents):
             cur = old_conf[aid]
@@ -501,7 +441,6 @@ class PIBTGenerator(ConfigGenerator):
                 neigh = list(graph.neighbors(cur))
                 if not graph.is_blocked(cur) and cur not in neigh:
                     neigh.append(cur)
-                # приоритет по дистанции до цели, если есть
                 if self.current_goals is not None:
                     goal = self.current_goals[aid]
                     def _heur(v: int) -> float:
@@ -530,13 +469,11 @@ class PIBTGenerator(ConfigGenerator):
                 order_seq.append(aid)
                 forced_seen.add(aid)
 
-        # DFS по комбинациям
         new_pos = [None] * num_agents
         used = set()
 
         def dfs(idx: int) -> bool:
             if idx == len(order_seq):
-                # edge-конфликты
                 if self._has_edge_conflict(old_conf.pos, new_pos):
                     return False
                 return True
@@ -546,7 +483,6 @@ class PIBTGenerator(ConfigGenerator):
                     continue
                 if v in used:
                     continue
-                # edge-свап с уже размещёнными
                 conflict = False
                 cur_pos = old_conf.pos[agent]
                 for j in range(idx):
@@ -583,11 +519,9 @@ class PIBTGenerator(ConfigGenerator):
         LL-ограничениям: нет вершинных/ребровых конфликтов, ходы допустимы,
         соблюдены положительные ограничения.
         """
-        # vertex collisions
         if len(set(new_conf.pos)) != len(new_conf.pos):
             return False
 
-        # допустимость ходов и positive constraints
         for aid, (u, v) in enumerate(zip(old_conf.pos, new_conf.pos)):
             if graph.is_blocked(v):
                 return False
@@ -597,12 +531,8 @@ class PIBTGenerator(ConfigGenerator):
             if forced is not None and forced != v:
                 return False
 
-        # edge swaps
         return not self._has_edge_conflict(old_conf.pos, list(new_conf.pos))
 
-    # ------------------------------------------------------------
-    # CONSTRAINT UTILS
-    # ------------------------------------------------------------
     def _collect_constraints(self, constraint: Constraint) -> tuple[Dict[int, int], List[int]]:
         """
         Собрать все positive constraints (who -> where) из цепочки
@@ -620,9 +550,6 @@ class PIBTGenerator(ConfigGenerator):
             order.append(constrained.who)
         return forced, order
 
-    # ------------------------------------------------------------
-    # EDGE CONFLICT CHECKS
-    # ------------------------------------------------------------
     def _has_edge_conflict(
         self,
         old_pos: tuple[int, ...],
@@ -659,7 +586,6 @@ class PIBTGenerator(ConfigGenerator):
             old[j] == next_v и new_pos[j] == cur_v
         """
         if next_v == cur_v:
-            # stay не может вызвать ребровой перестановки
             return False
 
         for j, qj in enumerate(new_pos):
