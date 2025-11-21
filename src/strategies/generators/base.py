@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Protocol, Optional
+from typing import Protocol, Optional, Callable
 
 from core.configuration import Configuration
 from core.constraint import Constraint
@@ -28,6 +28,7 @@ class ConfigGenerator(Protocol):
         hl_node: HLNode,
         constraint: Constraint,
         graph: GraphBase,
+        task_callback: Optional[Callable[[int, int, int], int]] = None,
     ) -> Optional[Configuration]:
         """
         Попытаться построить новую Configuration, учитывая:
@@ -36,6 +37,8 @@ class ConfigGenerator(Protocol):
             - топологию графа
             - порядок агентов (hl_node.order)
             - коллизии между агентами
+            - при необходимости вызвать task_callback, если агентов нужно
+              отправить на новую цель (используется при оконном планировании)
 
         Возвращает:
             Configuration — если удалось построить допустимую конфигурацию

@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Optional, Dict, List, Set, Optional as TypingOptional
+from typing import Optional, Dict, List, Set, Optional as TypingOptional, Callable
 from collections import Counter
 from math import ceil
 import time
@@ -76,6 +76,7 @@ class PIBTGenerator(ConfigGenerator):
         hl_node: HLNode,
         constraint: Constraint,
         graph: GraphBase,
+        task_callback: TypingOptional[Callable[[int, int, int], int]] = None,
     ) -> Optional[Configuration]:
         self._metrics["generate_calls"] += 1
         forced_moves, forced_order = self._collect_constraints(constraint)

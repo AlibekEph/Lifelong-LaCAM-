@@ -1,10 +1,28 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Optional, Set
+from typing import Optional, Set, List
 from collections import deque
 
 from .configuration import Configuration
 from .constraint import Constraint
+
+
+@dataclass
+class ClusterPlanSnapshot:
+    """
+    Снимок оконного планирования для кластера.
+
+    Храним:
+        agents               : список агентов кластера
+        window               : длина окна (w), с которым планировался кластер
+        constraint_chains    : список цепочек ограничений (root -> leaf) на каждый шаг окна
+        path                 : глобальные конфигурации, полученные при планировании (len = window+1)
+    """
+
+    agents: List[int]
+    window: int
+    constraint_chains: List[List[Constraint]]
+    path: List[Configuration]
 
 
 @dataclass(eq=False)
@@ -35,6 +53,12 @@ class HLNode:
     parent: Optional["HLNode"]
     cost_from_parent: int = 0
     neighbors: Set["HLNode"] = field(default_factory=set)
+    completed_sum: int = 0
+    # Доп. данные для кластеризации/оконного планирования (может быть None)
+    cluster_plan: Optional[List[ClusterPlanSnapshot]] = None
+    cluster_window_used: Optional[int] = None
+    cluster_ll_states: Optional[list] = None  # заполняется LifelongLaCAMIntegrated
+    cluster_cache: Optional[dict] = None  # cache успешных конфигураций по кластерам
 
     def is_goal(self, goal_config: Configuration) -> bool:
         """Проверка: достигли ли мы конфигурации целей."""

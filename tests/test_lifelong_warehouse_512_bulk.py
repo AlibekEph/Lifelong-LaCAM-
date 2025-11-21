@@ -5,13 +5,12 @@ import argparse
 import time
 import shutil
 import subprocess
-import signal
 from pathlib import Path
 from collections import deque
-from typing import List
 import random
 import numpy as np
 
+# Чтобы исполнять как сценарий, добавляем src в sys.path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from core.graph.grid import GridGraph
@@ -22,6 +21,8 @@ from strategies.ordering.persistent_ordering import PersistentPriorityOrdering
 from strategies.open_policy.stack import StackOpen
 from strategies.open_policy.completed_priority import CompletedPriorityOpen
 from utils.kiva_loader import layout_to_grid, generate_kiva_tasks
+
+WAREHOUSE_MAP_PATH = Path("data/warehouse_512_map.json")
 
 _VIS_EXPORT_ENV = os.environ.get("LACAM_VIS_EXPORT", "")
 _VIS_EXPORT_FLAG = True if _VIS_EXPORT_ENV == "" else _VIS_EXPORT_ENV.lower() in {"1", "true", "yes", "on"}
@@ -57,7 +58,6 @@ def export_visualizer_files(name: str, graph: GridGraph, config_list: list[Confi
 
 
 def sample_unique_free(graph: GridGraph, num: int, seed: int) -> list[int]:
-    import random
     rng = random.Random(seed)
     free = [idx for idx in range(graph.num_vertices()) if not graph.is_blocked(idx)]
     assert len(free) >= num, "Недостаточно свободных клеток для стартов"
@@ -80,9 +80,10 @@ def run_lacam(
     stop_mode: str,
     stop_value: int,
     enable_clustering: bool,
-    cluster_window: int,
     use_priority_open: bool,
+    cluster_window: int,
 ):
+    base_tasks = [list(agent_tasks) if agent_tasks else [] for agent_tasks in tasks]
     tasks_runtime = [deque(agent_tasks) for agent_tasks in tasks]
     max_tasks_per_agent = stop_value if stop_mode == "tasks" else max(len(t) for t in tasks)
     initial_goals = [q[0] for q in tasks_runtime]
@@ -91,6 +92,9 @@ def run_lacam(
         queue = tasks_runtime[agent_id]
         if queue and current_pos == queue[0]:
             queue.popleft()
+        if not queue and base_tasks[agent_id]:
+            # повторяем исходную последовательность, чтобы всегда были цели
+            queue.extend(base_tasks[agent_id])
         return queue[0] if queue else old_goal
 
     open_policy = CompletedPriorityOpen() if use_priority_open else StackOpen()
@@ -110,7 +114,7 @@ def run_lacam(
     )
 
     t0 = time.time()
-    max_iters = stop_value if stop_mode == "ticks" else 2_500_000
+    max_iters = stop_value if stop_mode == "ticks" else 5_000_000
     path = lacam.run(max_iterations=max_iters, verbose=False)
     if path is None:
         try:
@@ -129,6 +133,17 @@ def run_lacam(
             "path": None,
         }
     ticks = len(path) - 1
+
+    # Детализированные метрики для сверки с реализацией на C++
+    print(f"\n=== Python Metrics ===", file=sys.stderr)
+    print(f"Iterations: {lacam._hl_metrics.get('iterations', 0)}", file=sys.stderr)
+    print(f"LL expansions: {lacam._hl_metrics.get('ll_expansions', 0)}", file=sys.stderr)
+    print(f"LL nodes created: {lacam._hl_metrics.get('ll_nodes_created', 0)}", file=sys.stderr)
+    print(f"Generator successes: {lacam._hl_metrics.get('generator_successes', 0)}", file=sys.stderr)
+    print(f"Generator failures: {lacam._hl_metrics.get('generator_failures', 0)}", file=sys.stderr)
+    print(f"HL revisited nodes: {lacam._hl_metrics.get('hl_revisited_nodes', 0)}", file=sys.stderr)
+    print(f"HL nodes created: {lacam._hl_metrics.get('hl_nodes_created', 0)}", file=sys.stderr)
+
     return {
         "ticks": ticks,
         "total_moves": total_moves(path),
@@ -174,7 +189,7 @@ def run_pypibt(
         r, c = rc
         return graph.to_idx(r, c)
 
-    max_iters = stop_value if stop_mode == "ticks" else 2_500_000
+    max_iters = stop_value if stop_mode == "ticks" else 5_000_000
     while ticks < max_iters:
         positions_rc = [idx_to_rc(p) for p in positions]
         goals_rc = [idx_to_rc(g) for g in goals]
@@ -210,162 +225,26 @@ def run_pypibt(
     }
 
 
-# ---------------- RHCR baseline ----------------
-
-
-def _import_rhcr():
-    """
-    Lazy import for the RHCR solver from extern/gloriousDan-mapf.
-    Adds local repo to sys.path and backfills typing.TypeAlias for Python <3.10.
-    """
-    import typing  # local import to avoid polluting global namespace
-
-    mapf_root = Path(__file__).resolve().parents[1] / "extern" / "gloriousDan-mapf" / "mapf" / "src"
-    if str(mapf_root) not in sys.path:
-        sys.path.insert(0, str(mapf_root))
-
-    if not hasattr(typing, "TypeAlias"):
-        typing.TypeAlias = typing.Any  # type: ignore[attr-defined]
-
-    try:
-        from mapf.types.mapf_types import Vertex, MapfProblem, GridCell, GoalVerticesDict
-        from mapf.solvers.common_functions import convert_gridworld_to_new_gridworld
-        from mapf.solvers.rhcr_solver import RhcrSolver
-        from mapf.types.mapf_config import MapfConfig, CbsCAT
-    except Exception as exc:  # pragma: no cover - import guard
-        raise ImportError(
-            f"Не удалось импортировать RHCR из {mapf_root}. Установите зависимости (intervaltree) и проверьте репозиторий."
-        ) from exc
-
-    return Vertex, MapfProblem, GridCell, GoalVerticesDict, convert_gridworld_to_new_gridworld, RhcrSolver, MapfConfig, CbsCAT
-
-
-def run_rhcr(
-    graph: GridGraph,
-    starts: list[int],
-    tasks: list[list[int]],
-    stop_mode: str,
-    stop_value: int,
-):
-    Vertex, MapfProblem, GridCell, GoalVerticesDict, convert_gridworld_to_new_gridworld, RhcrSolver, MapfConfig, CbsCAT = _import_rhcr()
-
-    # convert grid to mapf format (x=col, y=row; True=blocked)
-    grid_world = [[GridCell(bool(graph.grid[r, c])) for c in range(graph.W)] for r in range(graph.H)]
-    new_grid = convert_gridworld_to_new_gridworld(grid_world)
-
-    start_vertex = {aid: Vertex(graph.to_rc(pos)[1], graph.to_rc(pos)[0]) for aid, pos in enumerate(starts)}
-    goal_vertices: GoalVerticesDict = {
-        aid: tuple(Vertex(graph.to_rc(pos)[1], graph.to_rc(pos)[0]) for pos in agent_tasks)
-        for aid, agent_tasks in enumerate(tasks)
-    }
-
-    config = MapfConfig()
-    # slightly tighter defaults to reduce runtime; can be tweaked later
-    config.RHCR_TIME_HORIZON_w = 5
-    config.RHCR_REPLANNING_PERIOD_h = 5
-    config.CBS_WINDOW = 5
-    config.A_STAR_MAX_SEARCH_COUNT = 2000
-    config.CBS_CONFLICT_AVOIDANCE = CbsCAT.ONLY_HIGHER
-
-    problem = MapfProblem(
-        agent_ids=list(range(len(starts))),
-        start_vertex=start_vertex,
-        grid=new_grid,
-        init_goal_vertices=goal_vertices,
-    )
-
-    class _Timeout(Exception):
-        pass
-
-    def _handler(_signum, _frame):
-        raise _Timeout()
-
-    old_handler = signal.signal(signal.SIGALRM, _handler)
-    signal.alarm(50)  # wall-clock guard requested by user
-    t0 = time.perf_counter()
-    try:
-        solution, cost = RhcrSolver.solve_instance(problem, config)
-        runtime = time.perf_counter() - t0
-    except _Timeout:
-        runtime = time.perf_counter() - t0
-        return {
-            "ticks": None,
-            "total_moves": None,
-            "completed_tasks": None,
-            "runtime": runtime,
-            "note": "timeout (50s wall clock)",
-            "path": None,
-        }
-    finally:
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, old_handler)
-
-    if not solution:
-        return {
-            "ticks": None,
-            "total_moves": None,
-            "completed_tasks": None,
-            "runtime": runtime,
-            "note": "no solution",
-            "path": None,
-        }
-
-    ticks = max(solution.keys())
-    # compute total moves by comparing consecutive time steps
-    moves = 0
-    prev = None
-    for t in sorted(solution.keys()):
-        step = solution[t]
-        if prev is not None:
-            for aid, (v, _) in step.items():
-                pv, _ = prev.get(aid, (v, 0))
-                if pv != v:
-                    moves += 1
-        prev = step
-
-    # count completed goals per agent
-    completed = [0 for _ in tasks]
-    progress = [0 for _ in tasks]
-    for t in sorted(solution.keys()):
-        step = solution[t]
-        for aid, goals in enumerate(tasks):
-            if progress[aid] >= len(goals):
-                continue
-            v_goal = goal_vertices[aid][progress[aid]]
-            v_cur, _ = step.get(aid, (None, 0))
-            if v_cur == v_goal:
-                progress[aid] += 1
-                completed[aid] += 1
-    return {
-        "ticks": ticks,
-        "total_moves": moves,
-        "completed_tasks": completed,
-        "runtime": runtime,
-        "note": None,
-        "path": None,
-    }
-
-
 def main():
-    parser = argparse.ArgumentParser(description="Детерминированный тест с большим числом задач (Kiva)")
-    parser.add_argument("--num-agents", type=int, default=100, help="Количество агентов")
-    parser.add_argument("--tasks-per-agent", type=int, default=5000, help="Число задач на агента")
-    parser.add_argument("--seed", type=int, default=0, help="Сид генерации стартов/задач")
-    parser.add_argument("--solver", choices=["lacam", "pypibt", "rhcr"], default="lacam", help="Выбор решателя")
+    parser = argparse.ArgumentParser(description="Массовый тест на складе 512x512 (warehouse layout)")
+    parser.add_argument("--map-json", type=Path, default=WAREHOUSE_MAP_PATH, help="Путь до json с раскладкой склада")
+    parser.add_argument("--num-agents", type=int, default=256, help="Количество агентов")
+    parser.add_argument("--tasks-per-agent", type=int, default=400, help="Число задач на агента")
+    parser.add_argument("--seed", type=int, default=7, help="Сид генерации стартов/задач")
+    parser.add_argument("--solver", choices=["lacam", "pypibt"], default="lacam", help="Выбор решателя")
     parser.add_argument("--stop-mode", choices=["tasks", "ticks"], default="tasks", help="Правило остановки")
-    parser.add_argument("--ticks-limit", type=int, default=10000, help="Лимит тиков при stop-mode=ticks")
+    parser.add_argument("--ticks-limit", type=int, default=20000, help="Лимит тиков при stop-mode=ticks")
     parser.add_argument("--no-clustering", action="store_true", help="Отключить кластеризацию (для lacam)")
-    parser.add_argument("--cluster-window", type=int, default=2, help="Максимальное окно кластеризации/PIBT (w)")
-    parser.add_argument("--priority-open", action="store_true", help="Приоритет HL узлов по числу выполненных задач")
+    parser.add_argument("--priority-open", action="store_true", help="Приоритизировать HL-узлы по числу выполненных задач")
+    parser.add_argument("--cluster-window", type=int, default=2, help="Максимальная длина окна для кластеризации (w)")
+    parser.add_argument("--min-goal-distance", type=int, default=6, help="Минимальное расстояние между целями подряд")
     args = parser.parse_args()
 
-    data_path = Path("data/kiva_large_tasks.json")
-    assert data_path.exists(), "Сгенерируйте задачи через scripts/generate_kiva_tasks.py"
-    payload = json.loads(data_path.read_text())
+    assert args.map_json.exists(), f"Не найден файл карты: {args.map_json}"
+    payload = json.loads(args.map_json.read_text())
     grid = layout_to_grid(payload["layout"])
     graph = GridGraph(grid)
 
-    # фиксируем RNG для воспроизводимости (PIBTGenerator использует random.shuffle)
     random.seed(args.seed)
     np.random.seed(args.seed)
 
@@ -376,7 +255,7 @@ def main():
         free_cells=[i for i in range(graph.num_vertices()) if not graph.is_blocked(i)],
         tasks_per_agent=args.tasks_per_agent,
         seed=args.seed,
-        min_goal_distance=4,
+        min_goal_distance=args.min_goal_distance,
     )
 
     stop_value = args.tasks_per_agent if args.stop_mode == "tasks" else args.ticks_limit
@@ -389,10 +268,10 @@ def main():
             stop_mode=args.stop_mode,
             stop_value=stop_value,
             enable_clustering=not args.no_clustering,
-            cluster_window=args.cluster_window,
             use_priority_open=args.priority_open,
+            cluster_window=args.cluster_window,
         )
-    elif args.solver == "pypibt":
+    else:
         result = run_pypibt(
             graph=graph,
             starts=starts,
@@ -401,25 +280,17 @@ def main():
             stop_value=stop_value,
             seed=args.seed,
         )
-    else:
-        result = run_rhcr(
-            graph=graph,
-            starts=starts,
-            tasks=tasks,
-            stop_mode=args.stop_mode,
-            stop_value=stop_value,
-        )
 
+    total_completed = sum(result["completed_tasks"]) if result["completed_tasks"] else "n/a"
     print(
         f"[{args.solver}] ticks={result['ticks']}, total_moves={result['total_moves']}, "
-        f"total_completed={sum(result['completed_tasks']) if result['completed_tasks'] else 'n/a'}, "
-        f"runtime={result['runtime']:.2f}s"
+        f"total_completed={total_completed}, runtime={result['runtime']:.2f}s"
     )
     if result.get("note"):
         print(f"note: {result['note']}")
 
     if _VIS_EXPORT_FLAG and result.get("path"):
-        name = f"kiva_bulk_{args.solver}"
+        name = f"warehouse512_bulk_{args.solver}"
         map_path, sol_path = export_visualizer_files(name, graph, result["path"])
         vis_bin = shutil.which("mapf-visualizer-lifelong")
         if vis_bin and map_path and sol_path:
